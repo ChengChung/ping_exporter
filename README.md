@@ -55,6 +55,21 @@ The configuration file is watched via inotify. If the configuration is changed,
 ping_exporter will update the targets. To change any global options like the ping
 interval or history size, you must restart the exporter.
 
+`--config.path` (or `CONFIG_FILE`) also accepts an HTTP or HTTPS URL:
+
+```console
+$ ./ping_exporter --config.path=https://example.com/ping.yml --config.refresh=30s
+```
+
+Remote configurations are fetched at startup and polled every minute by default.
+Use `--config.refresh` to set a positive polling interval. Each HTTP request has
+a 10-second timeout, and HTTPS uses the system's trusted certificates. The server
+must return HTTP 200 with the same YAML format as a local configuration file.
+Unchanged configurations are not reapplied. Failed requests, invalid YAML, or
+configurations with no targets are logged and leave the current targets in place;
+polling continues so later updates can recover. An initial fetch failure prevents
+startup. As with local files, global options require a restart.
+
 ### Exported metrics
 
 - `ping_rtt_best_seconds`: Best round trip time in seconds

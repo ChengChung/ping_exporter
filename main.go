@@ -7,9 +7,11 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -26,8 +28,9 @@ import (
 	inotify "gopkg.in/fsnotify.v1"
 )
 
-const version string = "1.3.0"
-const indexHTML = `<!doctype html>
+const (
+	version   string = "1.3.0"
+	indexHTML        = `<!doctype html>
 <html>
 <head>
 	<meta charset="UTF-8">
@@ -41,6 +44,7 @@ const indexHTML = `<!doctype html>
 </body>
 </html>
 `
+)
 
 var (
 	showVersion             = kingpin.Flag("version", "Print version information").Default().Bool()
@@ -52,7 +56,8 @@ var (
 	serverTLSKeyFile        = kingpin.Flag("web.tls.key-file", "The key file for the web server").Default("").String()
 	serverMutualAuthEnabled = kingpin.Flag("web.tls.mutual-auth-enabled", "Enable TLS client mutual authentication, default is false").Default().Bool()
 	serverTLSCAFile         = kingpin.Flag("web.tls.ca-file", "The certificate authority file for client's certificate verification").Default("").String()
-	configFile              = kingpin.Flag("config.path", "Path to config file").Envar("CONFIG_FILE").Default("").String()
+	configFile              = kingpin.Flag("config.path", "Path or HTTP(S) URL to config file").Envar("CONFIG_FILE").Default("").String()
+	configRefresh           = kingpin.Flag("config.refresh", "Polling interval for HTTP(S) config URLs (must be greater than 0)").Default("1m").Duration()
 	pingInterval            = kingpin.Flag("ping.interval", "Interval for ICMP echo requests").Default("5s").Duration()
 	pingTimeout             = kingpin.Flag("ping.timeout", "Timeout for ICMP echo request").Default("4s").Duration()
 	pingSize                = kingpin.Flag("ping.size", "Payload size for ICMP echo requests").Default("56").Uint16()
@@ -71,9 +76,10 @@ var (
 	enableDeprecatedMetrics = true // default may change in future
 	deprecatedMetrics       = kingpin.Flag("metrics.deprecated", "Enable or disable deprecated metrics (`ping_rtt_ms{type=best|worst|mean|std_dev}`). Valid choices: [enable, disable]").Default("disable").String()
 
-	rttMetricsScale = rttInMills // might change in future
-	rttMode         = kingpin.Flag("metrics.rttunit", "Export ping results as either seconds (default), or milliseconds (deprecated), or both (for migrations). Valid choices: [s, ms, both]").Default("s").String()
-	desiredTargets  *targets
+	rttMetricsScale  = rttInMills // might change in future
+	rttMode          = kingpin.Flag("metrics.rttunit", "Export ping results as either seconds (default), or milliseconds (deprecated), or both (for migrations). Valid choices: [s, ms, both]").Default("s").String()
+	desiredTargets   *targets
+	configHTTPClient = &http.Client{Timeout: 10 * time.Second}
 )
 
 func main() {
@@ -117,6 +123,10 @@ func main() {
 		metricsPath = &mpath
 	}
 
+	if isHTTPConfig(*configFile) && *configRefresh <= 0 {
+		kingpin.FatalUsage("config.refresh must be greater than 0")
+	}
+
 	cfg, err := loadConfig()
 	if err != nil {
 		kingpin.FatalUsage("could not load config.path: %v", err)
@@ -147,7 +157,7 @@ func runInteractive(cfg *config.Config) {
 	}
 
 	collector := NewPingCollector(enableDeprecatedMetrics, rttMetricsScale, m, cfg)
-	go watchConfig(desiredTargets, globalResolver, m, collector)
+	go watchConfig(desiredTargets, globalResolver, m, collector, cfg)
 
 	startServer(collector)
 }
@@ -253,11 +263,34 @@ func upsertTargets(globalTargets *targets, globalResolver Resolver, cfg *config.
 	return nil
 }
 
-func watchConfig(globalTargets *targets, globalResolver Resolver, monitor *mon.Monitor, collector *pingCollector) {
+func watchConfig(globalTargets *targets, globalResolver Resolver, monitor *mon.Monitor, collector *pingCollector, initial *config.Config) {
+	if *configFile == "" {
+		return
+	}
+
+	reload := func(cfg *config.Config) error {
+		log.Infof("reloading config %s", *configFile)
+		if err := upsertTargets(globalTargets, globalResolver, cfg, monitor); err != nil {
+			return err
+		}
+		collector.UpdateConfig(cfg)
+		return nil
+	}
+
+	if isHTTPConfig(*configFile) {
+		watchHTTPConfig(context.Background(), initial, reload)
+		return
+	}
+
 	watcher, err := inotify.NewWatcher()
 	if err != nil {
 		log.Fatalf("unable to create file watcher: %v", err)
 	}
+	defer func() {
+		if err := watcher.Close(); err != nil {
+			log.Errorf("failed to close file watcher: %v", err)
+		}
+	}()
 
 	err = watcher.Add(*configFile)
 	if err != nil {
@@ -283,14 +316,43 @@ func watchConfig(globalTargets *targets, globalResolver Resolver, monitor *mon.M
 			if len(cfg.Targets) == 0 {
 				continue
 			}
-			log.Infof("reloading config file %s", *configFile)
-			if err := upsertTargets(globalTargets, globalResolver, cfg, monitor); err != nil {
+			if err := reload(cfg); err != nil {
 				log.Errorf("failed to reload config: %v", err)
 				continue
 			}
-			collector.UpdateConfig(cfg)
 		case err := <-watcher.Errors:
 			log.Errorf("watching file failed: %v", err)
+		}
+	}
+}
+
+func watchHTTPConfig(ctx context.Context, initial *config.Config, reload func(*config.Config) error) {
+	ticker := time.NewTicker(*configRefresh)
+	defer ticker.Stop()
+
+	current := initial
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cfg, err := loadConfigContext(ctx)
+			if err != nil {
+				log.Errorf("unable to load HTTP config: %v", err)
+				continue
+			}
+			if len(cfg.Targets) == 0 {
+				log.Error("ignoring HTTP config with no targets")
+				continue
+			}
+			if reflect.DeepEqual(current, cfg) {
+				continue
+			}
+			if err := reload(cfg); err != nil {
+				log.Errorf("failed to reload HTTP config: %v", err)
+				continue
+			}
+			current = cfg
 		}
 	}
 }
@@ -450,6 +512,15 @@ func initMutualAuth(server *http.Server) error {
 }
 
 func loadConfig() (*config.Config, error) {
+	return loadConfigContext(context.Background())
+}
+
+func isHTTPConfig(path string) bool {
+	path = strings.ToLower(path)
+	return strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://")
+}
+
+func loadConfigContext(ctx context.Context) (*config.Config, error) {
 	if *configFile == "" {
 		cfg := config.Config{}
 		addFlagToConfig(&cfg)
@@ -457,7 +528,27 @@ func loadConfig() (*config.Config, error) {
 		return &cfg, nil
 	}
 
-	f, err := os.Open(*configFile)
+	var f io.ReadCloser
+	var err error
+	if isHTTPConfig(*configFile) {
+		req, requestErr := http.NewRequestWithContext(ctx, http.MethodGet, *configFile, nil)
+		if requestErr != nil {
+			return nil, fmt.Errorf("cannot create config request: %w", requestErr)
+		}
+		resp, requestErr := configHTTPClient.Do(req)
+		if requestErr != nil {
+			return nil, fmt.Errorf("cannot fetch config: %w", requestErr)
+		}
+		f = resp.Body
+		if resp.StatusCode != http.StatusOK {
+			if err := f.Close(); err != nil {
+				log.Errorf("failed to close config response: %v", err)
+			}
+			return nil, fmt.Errorf("cannot fetch config: HTTP %s", resp.Status)
+		}
+	} else {
+		f, err = os.Open(*configFile)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("cannot load config file: %w", err)
 	}
