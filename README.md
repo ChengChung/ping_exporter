@@ -111,6 +111,82 @@ Getting the results for testing via cURL:
 $ curl http://localhost:9427/metrics
 ```
 
+### Pushing metrics
+
+Metrics can also be pushed periodically to a VictoriaMetrics Prometheus text
+import endpoint while `/metrics` remains available for scraping:
+
+```console
+$ ./ping_exporter -pushmetrics.url=http://victoriametrics:8428/api/v1/import/prometheus --pushmetrics.queue-dir=/var/lib/ping_exporter/queue --config.path=my-config-file
+```
+
+For a VictoriaMetrics cluster, use
+`http://vminsert:8480/insert/0/prometheus/api/v1/import/prometheus` (replace `0`
+with the tenant ID). This sends HTTP POST requests with Prometheus text, not
+Prometheus remote_write or the Pushgateway protocol. Both `-pushmetrics.*` and
+`--pushmetrics.*` flags are accepted.
+
+| Flag | Default | Description |
+| ---- | ------- | ----------- |
+| `--pushmetrics.url` | empty (disabled) | Full HTTP(S) import URL |
+| `--pushmetrics.extraLabel` | none | Repeatable `name="value"` label applied to all pushed metrics |
+| `--pushmetrics.interval` | `10s` | Snapshot and retry interval; must be positive |
+| `--pushmetrics.timeout` | `10s` | Per-request timeout; must be positive |
+| `--pushmetrics.queue-dir` | `pushmetrics-queue` | Writable persistent queue directory |
+| `--pushmetrics.max-disk-usage` | `1073741824` | Maximum queued payload bytes (1 GiB) |
+| `--pushmetrics.max-inmemory-requests` | `100` | Maximum in-memory batches before spilling; `0` always queues on disk |
+
+Snapshots first enter a FIFO memory queue, retaining their original sample
+timestamps in milliseconds. A batch being sent still counts toward the memory
+limit until acknowledged. When the queue reaches the configured batch count,
+all its batches are written to disk one by one, in order. While any disk batches
+remain, new snapshots go directly to disk and the memory queue is not used.
+After the disk backlog is completely acknowledged, memory buffering resumes.
+Startup with an existing disk backlog also starts in disk-only mode. The memory
+limit counts batches, not bytes; actual memory use depends on snapshot sizes.
+
+Network failures and non-2xx responses retain the batch for retry. One sender
+replays oldest batches first, independently of periodic collection, and removes
+a batch only after a successful response. Restarting with the same directory
+recovers disk batches, but unsent batches still in memory are lost when the
+process exits. Set `--pushmetrics.max-inmemory-requests=0` to retain the original
+write-before-send behavior when restart durability is required for every batch.
+HTTPS uses the system trust store; HTTP redirects are not followed.
+
+Use a persistent volume in containers and a separate queue directory for each
+process. Keep the directory dedicated to this queue, and drain it before
+changing the destination URL. The byte limit covers queued payloads, not
+filesystem metadata. If spilling is interrupted by a write error or the disk
+limit, already written batches stay on disk and the remaining old batches stay
+in memory. New snapshots are rejected with an error log until those batches can
+be spilled or drained; batches on disk are always sent first. Disk-only enqueue
+failures also lose new snapshots. Delivery of retained batches is at least once:
+a lost acknowledgement or a crash after remote acceptance can cause duplicate
+samples. Set the remote retention policy to accept the oldest samples you expect
+to replay.
+
+When multiple nodes push to the same destination, use extra labels to identify
+the node and job:
+
+```console
+$ ./ping_exporter -pushmetrics.url=http://victoriametrics:8428/api/v1/import/prometheus \
+  -pushmetrics.extraLabel='instance="foobar"' \
+  -pushmetrics.extraLabel='job="vm"' \
+  --config.path=my-config-file
+```
+
+Each flag accepts one `name="value"` pair, with a double-quoted value supporting
+escapes such as `\"`, `\\`, and `\n`. Names must match
+`[a-zA-Z_][a-zA-Z0-9_]*` and must not start with the reserved `__` prefix.
+Extra labels override existing labels with the same name; when a flag repeats
+the same name, its last value wins. They apply only to pushed metrics, not
+`/metrics`, and are saved in each queued snapshot. Changing flags does not
+relabel already queued batches. No `job` or `instance` labels are added unless
+configured. Existing YAML target labels are also supported.
+
+The existing `--web.token` only protects incoming web requests and is not sent
+to the push endpoint.
+
 ### Running as non-root user
 
 On Linux systems `CAP_NET_RAW` is required to run `ping_exporter` as unpriviliged user.

@@ -70,6 +70,13 @@ var (
 	disableIPv4             = kingpin.Flag("options.disable-ipv4", "Disable DNS from resolving IPv4 A records").Default().Bool()
 	logLevel                = kingpin.Flag("log.level", "Only log messages with the given severity or above. Valid levels: [debug, info, warn, error, fatal]").Default("info").String()
 	targetFlag              = kingpin.Arg("targets", "A list of targets to ping").Strings()
+	pushMetricsURL          = kingpin.Flag("pushmetrics.url", "HTTP(S) Prometheus text import endpoint (empty disables pushing)").Default("").String()
+	pushMetricsExtraLabels  = kingpin.Flag("pushmetrics.extraLabel", "Extra label for pushed metrics in name=\"value\" format; repeatable, overrides existing labels").Strings()
+	pushMetricsInterval     = kingpin.Flag("pushmetrics.interval", "Metrics snapshot and retry interval").Default("10s").Duration()
+	pushMetricsTimeout      = kingpin.Flag("pushmetrics.timeout", "Timeout for each metrics push request").Default("10s").Duration()
+	pushMetricsQueueDir     = kingpin.Flag("pushmetrics.queue-dir", "Persistent metrics queue directory; must not be shared between processes").Default("pushmetrics-queue").String()
+	pushMetricsMaxDiskUsage = kingpin.Flag("pushmetrics.max-disk-usage", "Maximum queued payload bytes; new snapshots are dropped when full").Default("1073741824").Int64()
+	pushMetricsMaxInmemory  = kingpin.Flag("pushmetrics.max-inmemory-requests", "Maximum in-memory batches before spilling to disk (0 always uses disk)").Default("100").Int()
 )
 
 var (
@@ -89,6 +96,11 @@ func main() {
 	args := os.Args[1:]
 	if extra := os.Getenv("CMD_FLAGS"); extra != "" {
 		args = append(args, strings.Fields(extra)...)
+	}
+	for index, arg := range args {
+		if strings.HasPrefix(arg, "-pushmetrics.") {
+			args[index] = "-" + arg
+		}
 	}
 	kingpin.MustParse(kingpin.CommandLine.Parse(args))
 
@@ -125,6 +137,20 @@ func main() {
 
 	if isHTTPConfig(*configFile) && *configRefresh <= 0 {
 		kingpin.FatalUsage("config.refresh must be greater than 0")
+	}
+	if *pushMetricsURL != "" {
+		if err := validatePushMetrics(*pushMetricsURL, *pushMetricsInterval, *pushMetricsTimeout); err != nil {
+			kingpin.FatalUsage("%v", err)
+		}
+		if *pushMetricsMaxDiskUsage <= 0 || *pushMetricsQueueDir == "" {
+			kingpin.FatalUsage("pushmetrics.max-disk-usage must be greater than 0 and pushmetrics.queue-dir must not be empty")
+		}
+		if *pushMetricsMaxInmemory < 0 {
+			kingpin.FatalUsage("pushmetrics.max-inmemory-requests must not be negative")
+		}
+	}
+	if _, err := parsePushMetricsExtraLabels(*pushMetricsExtraLabels); err != nil {
+		kingpin.FatalUsage("%v", err)
 	}
 
 	cfg, err := loadConfig()
@@ -407,6 +433,20 @@ func startServer(collector *pingCollector) {
 
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(collector)
+	if *pushMetricsURL != "" {
+		extraLabels, err := parsePushMetricsExtraLabels(*pushMetricsExtraLabels)
+		if err != nil {
+			log.Fatalf("invalid metrics push labels: %v", err)
+		}
+		queue, err := openMetricsQueue(*pushMetricsQueueDir, *pushMetricsMaxDiskUsage, *pushMetricsMaxInmemory)
+		if err != nil {
+			log.Fatalf("could not open metrics queue: %v", err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go runPushMetrics(ctx, reg, queue, *pushMetricsURL, *pushMetricsInterval, *pushMetricsTimeout, extraLabels)
+		log.Infof("Metrics push enabled (interval %s, queue directory %s)", *pushMetricsInterval, *pushMetricsQueueDir)
+	}
 
 	l := log.New()
 	l.Level = log.ErrorLevel
