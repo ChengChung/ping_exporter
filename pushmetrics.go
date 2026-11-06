@@ -354,3 +354,80 @@ func runPushMetrics(ctx context.Context, gatherer prometheus.Gatherer, queue *me
 		}
 	}
 }
+
+// pushMetricsWorker represents a single push metrics endpoint with its own queue
+type pushMetricsWorker struct {
+	endpoint string
+	queue    *metricsQueue
+	index    int // order-based index, not address-based
+}
+
+// runPushMetricsMulti manages multiple independent push metric workers,
+// each with its own queue ordered by index rather than endpoint value
+func runPushMetricsMulti(ctx context.Context, gatherer prometheus.Gatherer, workers []*pushMetricsWorker, interval, timeout time.Duration, extraLabels prometheus.Labels) {
+	if len(workers) == 0 {
+		return
+	}
+
+	client := &http.Client{
+		Timeout: timeout,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	defer client.CloseIdleConnections()
+
+	// ready signal for each worker
+	readyChans := make([]chan struct{}, len(workers))
+	for i := range readyChans {
+		readyChans[i] = make(chan struct{}, 1)
+	}
+
+	// Start a flush goroutine for each worker
+	var wg sync.WaitGroup
+	for idx, worker := range workers {
+		wg.Add(1)
+		go func(w *pushMetricsWorker, readyChan chan struct{}) {
+			defer wg.Done()
+			retry := time.NewTicker(interval)
+			defer retry.Stop()
+			for {
+				if err := w.queue.flush(ctx, client, w.endpoint); err != nil && ctx.Err() == nil {
+					log.WithError(err).Warnf("Metrics push to endpoint #%d (%s) failed; queued data will be retried", w.index+1, w.endpoint)
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-readyChan:
+				case <-retry.C:
+				}
+			}
+		}(worker, readyChans[idx])
+	}
+
+	// Capture and enqueue metrics to all workers
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		data, err := captureMetrics(gatherer, time.Now(), extraLabels)
+		if err == nil {
+			for idx, worker := range workers {
+				if qErr := worker.queue.enqueue(data); qErr != nil {
+					log.WithError(qErr).Errorf("Could not queue metrics snapshot for endpoint #%d", idx+1)
+				} else {
+					select {
+					case readyChans[idx] <- struct{}{}:
+					default:
+					}
+				}
+			}
+		} else {
+			log.WithError(err).Error("Could not capture metrics snapshot")
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}

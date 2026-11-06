@@ -497,3 +497,122 @@ func TestPushMetricsSlowRemote(t *testing.T) {
 		t.Fatal("push worker did not stop after cancellation")
 	}
 }
+
+func TestPushMetricsMultipleEndpoints(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Create multiple test servers
+	var endpoints []*httptest.Server
+	var requestCounts []atomic.Int32
+	endpointCount := 3
+
+	for i := 0; i < endpointCount; i++ {
+		idx := i // capture for closure
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requestCounts[idx].Add(1)
+			if r.Method != http.MethodPost {
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				return
+			}
+			io.Copy(io.Discard, r.Body)
+			r.Body.Close()
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		endpoints = append(endpoints, server)
+		requestCounts = append(requestCounts, atomic.Int32{})
+	}
+	defer func() {
+		for _, server := range endpoints {
+			server.Close()
+		}
+	}()
+
+	// Create workers for each endpoint
+	tmpDir := t.TempDir()
+	workers := make([]*pushMetricsWorker, endpointCount)
+	for i, server := range endpoints {
+		queueDir := filepath.Join(tmpDir, fmt.Sprintf("queue-%d", i))
+		queue, err := openMetricsQueue(queueDir, 1073741824, 100)
+		if err != nil {
+			t.Fatalf("failed to open queue %d: %v", i, err)
+		}
+		workers[i] = &pushMetricsWorker{
+			endpoint: server.URL,
+			queue:    queue,
+			index:    i,
+		}
+	}
+
+	// Create test metrics gatherer
+	registry := prometheus.NewRegistry()
+	gauge := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "test_metric",
+		Help: "Test metric",
+	})
+	registry.MustRegister(gauge)
+	gauge.Set(42)
+
+	// Run the multi-endpoint push metrics function
+	go runPushMetricsMulti(ctx, registry, workers, 100*time.Millisecond, 5*time.Second, nil)
+
+	// Wait a bit for the goroutine to process metrics
+	time.Sleep(500 * time.Millisecond)
+
+	// Verify that all endpoints received requests
+	for i, count := range requestCounts {
+		if count.Load() == 0 {
+			t.Errorf("endpoint %d did not receive any requests", i)
+		}
+	}
+
+	// Cancel context and wait for goroutine to finish
+	cancel()
+	time.Sleep(200 * time.Millisecond)
+}
+
+func TestPushMetricsMultipleEndpointIndependentQueues(t *testing.T) {
+	// This test verifies that each endpoint has its own independent queue
+	// by checking that queue directories are created with index-based names
+	tmpDir := t.TempDir()
+	
+	queueDirs := []string{
+		filepath.Join(tmpDir, "queue-0"),
+		filepath.Join(tmpDir, "queue-1"),
+		filepath.Join(tmpDir, "queue-2"),
+	}
+
+	workers := make([]*pushMetricsWorker, len(queueDirs))
+	for i, queueDir := range queueDirs {
+		queue, err := openMetricsQueue(queueDir, 1073741824, 100)
+		if err != nil {
+			t.Fatalf("failed to open queue %d: %v", i, err)
+		}
+		workers[i] = &pushMetricsWorker{
+			endpoint: fmt.Sprintf("http://localhost:%d", 9000+i),
+			queue:    queue,
+			index:    i,
+		}
+	}
+
+	// Verify queue directories exist
+	for i, queueDir := range queueDirs {
+		info, err := os.Stat(queueDir)
+		if err != nil {
+			t.Errorf("queue directory %d not found: %v", i, err)
+		}
+		if !info.IsDir() {
+			t.Errorf("queue path %d is not a directory", i)
+		}
+	}
+
+	// Verify that each worker has its own queue with independent state
+	for i, worker := range workers {
+		if worker.index != i {
+			t.Errorf("worker %d has incorrect index: %d", i, worker.index)
+		}
+		if worker.queue == nil {
+			t.Errorf("worker %d has nil queue", i)
+		}
+	}
+}

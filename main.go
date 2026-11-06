@@ -11,7 +11,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -70,7 +72,7 @@ var (
 	disableIPv4             = kingpin.Flag("options.disable-ipv4", "Disable DNS from resolving IPv4 A records").Default().Bool()
 	logLevel                = kingpin.Flag("log.level", "Only log messages with the given severity or above. Valid levels: [debug, info, warn, error, fatal]").Default("info").String()
 	targetFlag              = kingpin.Arg("targets", "A list of targets to ping").Strings()
-	pushMetricsURL          = kingpin.Flag("pushmetrics.url", "HTTP(S) Prometheus text import endpoint (empty disables pushing)").Default("").String()
+	pushMetricsURLs         = kingpin.Flag("pushmetrics.url", "HTTP(S) Prometheus text import endpoint (repeatable, empty disables pushing)").Strings()
 	pushMetricsExtraLabels  = kingpin.Flag("pushmetrics.extraLabel", "Extra label for pushed metrics in name=\"value\" format; repeatable, overrides existing labels").Strings()
 	pushMetricsInterval     = kingpin.Flag("pushmetrics.interval", "Metrics snapshot and retry interval").Default("10s").Duration()
 	pushMetricsTimeout      = kingpin.Flag("pushmetrics.timeout", "Timeout for each metrics push request").Default("10s").Duration()
@@ -138,9 +140,11 @@ func main() {
 	if isHTTPConfig(*configFile) && *configRefresh <= 0 {
 		kingpin.FatalUsage("config.refresh must be greater than 0")
 	}
-	if *pushMetricsURL != "" {
-		if err := validatePushMetrics(*pushMetricsURL, *pushMetricsInterval, *pushMetricsTimeout); err != nil {
-			kingpin.FatalUsage("%v", err)
+	if len(*pushMetricsURLs) > 0 {
+		for idx, url := range *pushMetricsURLs {
+			if err := validatePushMetrics(url, *pushMetricsInterval, *pushMetricsTimeout); err != nil {
+				kingpin.FatalUsage("pushmetrics.url #%d: %v", idx+1, err)
+			}
 		}
 		if *pushMetricsMaxDiskUsage <= 0 || *pushMetricsQueueDir == "" {
 			kingpin.FatalUsage("pushmetrics.max-disk-usage must be greater than 0 and pushmetrics.queue-dir must not be empty")
@@ -433,19 +437,31 @@ func startServer(collector *pingCollector) {
 
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(collector)
-	if *pushMetricsURL != "" {
+	if len(*pushMetricsURLs) > 0 {
 		extraLabels, err := parsePushMetricsExtraLabels(*pushMetricsExtraLabels)
 		if err != nil {
 			log.Fatalf("invalid metrics push labels: %v", err)
 		}
-		queue, err := openMetricsQueue(*pushMetricsQueueDir, *pushMetricsMaxDiskUsage, *pushMetricsMaxInmemory)
-		if err != nil {
-			log.Fatalf("could not open metrics queue: %v", err)
+		
+		pushWorkers := make([]*pushMetricsWorker, len(*pushMetricsURLs))
+		for idx, url := range *pushMetricsURLs {
+			queueDir := filepath.Join(*pushMetricsQueueDir, strconv.Itoa(idx))
+			queue, err := openMetricsQueue(queueDir, *pushMetricsMaxDiskUsage, *pushMetricsMaxInmemory)
+			if err != nil {
+				log.Fatalf("could not open metrics queue for endpoint #%d: %v", idx+1, err)
+			}
+			pushWorkers[idx] = &pushMetricsWorker{
+				endpoint: url,
+				queue:    queue,
+				index:    idx,
+			}
 		}
+		
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		go runPushMetrics(ctx, reg, queue, *pushMetricsURL, *pushMetricsInterval, *pushMetricsTimeout, extraLabels)
-		log.Infof("Metrics push enabled (interval %s, queue directory %s)", *pushMetricsInterval, *pushMetricsQueueDir)
+		go runPushMetricsMulti(ctx, reg, pushWorkers, *pushMetricsInterval, *pushMetricsTimeout, extraLabels)
+		log.Infof("Metrics push enabled for %d endpoint(s) (interval %s, queue directory %s)", 
+			len(*pushMetricsURLs), *pushMetricsInterval, *pushMetricsQueueDir)
 	}
 
 	l := log.New()
