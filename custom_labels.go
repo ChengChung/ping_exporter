@@ -1,13 +1,17 @@
 package main
 
-import "github.com/czerwonk/ping_exporter/config"
+import (
+	"sort"
+
+	"github.com/czerwonk/ping_exporter/config"
+)
 
 type customLabelSet struct {
 	names   []string
 	nameMap map[string]any
 }
 
-func newCustomLabelSet(targets []config.TargetConfig) *customLabelSet {
+func newCustomLabelSet(targets []config.TargetConfig, globalLabels map[string]string) *customLabelSet {
 	cl := &customLabelSet{
 		nameMap: make(map[string]any),
 		names:   make([]string, 0),
@@ -16,6 +20,10 @@ func newCustomLabelSet(targets []config.TargetConfig) *customLabelSet {
 	for _, t := range targets {
 		cl.addLabelsForTarget(&t)
 	}
+	for name := range globalLabels {
+		cl.addLabel(name)
+	}
+	sort.Strings(cl.names)
 
 	return cl
 }
@@ -31,6 +39,9 @@ func (cl *customLabelSet) addLabelsForTarget(t *config.TargetConfig) {
 }
 
 func (cl *customLabelSet) addLabel(name string) {
+	if name == "target" || name == "ip" || name == "ip_version" || name == "type" {
+		return
+	}
 	_, exists := cl.nameMap[name]
 	if exists {
 		return

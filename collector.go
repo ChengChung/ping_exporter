@@ -3,6 +3,7 @@
 package main
 
 import (
+	"maps"
 	"strings"
 	"sync"
 
@@ -40,7 +41,7 @@ func NewPingCollector(enableDeprecatedMetrics bool, unit rttUnit, monitor *mon.M
 		rttUnit:                 unit,
 		cfg:                     cfg,
 	}
-	ret.customLabels = newCustomLabelSet(cfg.Targets)
+	ret.customLabels = newCustomLabelSet(cfg.Targets, cfg.Labels)
 	ret.createDesc()
 	return ret
 }
@@ -48,12 +49,17 @@ func NewPingCollector(enableDeprecatedMetrics bool, unit rttUnit, monitor *mon.M
 func (p *pingCollector) UpdateConfig(cfg *config.Config) {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
-	p.cfg.Targets = cfg.Targets
-	p.customLabels = newCustomLabelSet(cfg.Targets)
+	updated := *p.cfg
+	updated.Targets = cfg.Targets
+	updated.Labels = cfg.Labels
+	p.cfg = &updated
+	p.customLabels = newCustomLabelSet(cfg.Targets, cfg.Labels)
 	p.createDesc()
 }
 
 func (p *pingCollector) Describe(ch chan<- *prometheus.Desc) {
+	p.mutex.RLock()
+	defer p.mutex.RUnlock()
 	if p.enableDeprecatedMetrics {
 		p.rttDesc.Describe(ch)
 	}
@@ -79,7 +85,25 @@ func (p *pingCollector) Collect(ch chan<- prometheus.Metric) {
 		l := strings.SplitN(target, " ", 3)
 
 		targetConfig := p.cfg.TargetConfigByAddr(l[0])
-		l = append(l, p.customLabels.labelValues(targetConfig)...)
+		configured := false
+		for _, current := range p.cfg.Targets {
+			if current.Addr == l[0] {
+				configured = true
+				break
+			}
+		}
+		if !configured {
+			continue
+		}
+		labels := make(map[string]string, len(p.cfg.Labels)+len(targetConfig.Labels))
+		maps.Copy(labels, p.cfg.Labels)
+		maps.Copy(labels, targetConfig.Labels)
+		for index, name := range []string{"target", "ip", "ip_version"} {
+			if value, exists := labels[name]; exists {
+				l[index] = value
+			}
+		}
+		l = append(l, p.customLabels.labelValues(config.TargetConfig{Labels: labels})...)
 
 		if metrics.PacketsSent == 0 {
 			continue
@@ -114,7 +138,9 @@ func (p *pingCollector) createDesc() {
 	p.meanDesc = newScaledDesc("rtt_mean", "Mean round trip time", p.rttUnit, labelNames)
 	p.stddevDesc = newScaledDesc("rtt_std_deviation", "Standard deviation", p.rttUnit, labelNames)
 	p.lossDesc = newDesc("loss_ratio", "Packet loss from 0.0 to 1.0", labelNames, nil)
-	p.progDesc = newDesc("up", "ping_exporter version", nil, prometheus.Labels{"version": version})
+	globalLabels := prometheus.Labels{"version": version}
+	maps.Copy(globalLabels, p.cfg.Labels)
+	p.progDesc = newDesc("up", "ping_exporter version", nil, globalLabels)
 }
 
 func newDesc(name, help string, variableLabels []string, constLabels prometheus.Labels) *prometheus.Desc {

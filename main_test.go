@@ -42,7 +42,7 @@ func TestLoadConfigSources(t *testing.T) {
 	defer tlsServer.Close()
 
 	path := filepath.Join(t.TempDir(), "config.yml")
-	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -139,7 +139,7 @@ func TestWatchHTTPConfig(t *testing.T) {
 	preserveConfigFlags(t)
 	*configRefresh = 5 * time.Millisecond
 	const original = "targets: [127.0.0.1, 127.0.0.2]"
-	const changed = "targets:\n  - host: 127.0.0.1\n    site: updated\n  - 127.0.0.3\n"
+	const changed = "labels: {location: CN}\ntargets:\n  - host: 127.0.0.1\n    site: updated\n  - 127.0.0.3\n"
 	const removed = "targets: [127.0.0.3]"
 	responses := []struct {
 		status int
@@ -149,11 +149,12 @@ func TestWatchHTTPConfig(t *testing.T) {
 		{http.StatusOK, original}, // No change.
 		{http.StatusServiceUnavailable, "unavailable"},
 		{http.StatusOK, "targets: ["},
-		{http.StatusOK, "targets: []"},
+		{http.StatusOK, "{}"},
 		{http.StatusOK, changed}, // Applying this update fails once.
 		{http.StatusOK, changed}, // Retry the same update.
 		{http.StatusOK, changed}, // Already applied; do not reload.
 		{http.StatusOK, removed},
+		{http.StatusOK, "labels: {location: JP}\ntargets: []"},
 	}
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -182,7 +183,7 @@ func TestWatchHTTPConfig(t *testing.T) {
 			if len(updates) == 1 {
 				return fmt.Errorf("temporary reload failure")
 			}
-			if len(cfg.Targets) == 1 {
+			if len(cfg.Targets) == 0 {
 				cancel()
 			}
 			return nil
@@ -196,8 +197,8 @@ func TestWatchHTTPConfig(t *testing.T) {
 		<-done
 		t.Fatal("HTTP configuration watcher did not apply updates")
 	}
-	if len(updates) != 3 {
-		t.Fatalf("reload count = %d, want 3 (failed attempt, retry, removal)", len(updates))
+	if len(updates) != 4 {
+		t.Fatalf("reload count = %d, want 4 (failed attempt, retry, removal, clear)", len(updates))
 	}
 	if !reflect.DeepEqual(updates[0], updates[1]) {
 		t.Fatal("failed reload was not retried with the same configuration")
@@ -208,7 +209,23 @@ func TestWatchHTTPConfig(t *testing.T) {
 	if updates[2].Targets[0].Addr != "127.0.0.3" {
 		t.Fatalf("unexpected targets after removal: %#v", updates[2].Targets)
 	}
+	if updates[1].Labels["location"] != "CN" || updates[3].Labels["location"] != "JP" || updates[3].Targets == nil || len(updates[3].Targets) != 0 {
+		t.Fatalf("global labels or explicit empty target update lost: %#v", updates[3])
+	}
 	if got := requests.Load(); got != int32(len(responses)) {
 		t.Fatalf("requests = %d, want %d", got, len(responses))
+	}
+}
+
+func TestExplicitEmptyTargets(t *testing.T) {
+	preserveConfigFlags(t)
+	*targetFlag = []string{"127.0.0.1"}
+	cfg, err := config.FromYAML(strings.NewReader("labels: {location: CN}\ntargets: []"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	addFlagToConfig(cfg)
+	if cfg.Targets == nil || len(cfg.Targets) != 0 {
+		t.Fatalf("explicit empty targets replaced by CLI targets: %#v", cfg.Targets)
 	}
 }

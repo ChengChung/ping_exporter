@@ -52,8 +52,28 @@ $ ./ping_exporter --dns.nameserver=1.1.1.1:53 [other options]
 ```
 
 The configuration file is watched via inotify. If the configuration is changed,
-ping_exporter will update the targets. To change any global options like the ping
+ping_exporter will update the targets and labels. To change global options like the ping
 interval or history size, you must restart the exporter.
+
+Top-level `labels` apply to every metric, including `ping_up`. Target-specific
+labels override global labels on that target's metrics only:
+
+```yaml
+labels:
+  location: CN
+  instance: CAN-CT163
+targets:
+  - host: 104.245.12.188
+    target: xTom.SJC
+  - host: 128.1.145.129
+    target: Zenlayer.HKG
+```
+
+Target labels are flat keys next to `host`, not a nested `labels` mapping.
+Configured `target`, `ip`, and `ip_version` labels override the corresponding
+built-in values without changing the address being pinged. Global labels and
+target labels are reloaded with the configuration. Pushmetrics extra labels,
+when configured, take precedence for pushed metrics only.
 
 `--config.path` (or `CONFIG_FILE`) also accepts an HTTP or HTTPS URL:
 
@@ -66,9 +86,12 @@ Use `--config.refresh` to set a positive polling interval. Each HTTP request has
 a 10-second timeout, and HTTPS uses the system's trusted certificates. The server
 must return HTTP 200 with the same YAML format as a local configuration file.
 Unchanged configurations are not reapplied. Failed requests, invalid YAML, or
-configurations with no targets are logged and leave the current targets in place;
+configurations without a targets field are logged and leave the current targets in place;
 polling continues so later updates can recover. An initial fetch failure prevents
-startup. As with local files, global options require a restart.
+startup. An explicit `targets: []` is accepted at startup and on reload, and stops
+all target monitoring while keeping `ping_up` available. An empty target list is
+not replaced by positional command-line targets. As with local files, ping and
+DNS options require a restart; labels do not.
 
 ### Exported metrics
 

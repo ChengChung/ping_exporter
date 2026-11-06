@@ -13,6 +13,8 @@ import (
 type Config struct {
 	Targets []TargetConfig `yaml:"targets"`
 
+	Labels map[string]string `yaml:"labels,omitempty"`
+
 	Ping struct {
 		Interval     duration `yaml:"interval"`
 		Timeout      duration `yaml:"timeout"`
