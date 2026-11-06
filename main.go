@@ -76,7 +76,8 @@ var (
 	pushMetricsExtraLabels  = kingpin.Flag("pushmetrics.extraLabel", "Extra label for pushed metrics in name=\"value\" format; repeatable, overrides existing labels").Strings()
 	pushMetricsInterval     = kingpin.Flag("pushmetrics.interval", "Metrics snapshot and retry interval").Default("10s").Duration()
 	pushMetricsTimeout      = kingpin.Flag("pushmetrics.timeout", "Timeout for each metrics push request").Default("10s").Duration()
-	pushMetricsQueueDir     = kingpin.Flag("pushmetrics.queue-dir", "Persistent metrics queue directory; must not be shared between processes").Default("pushmetrics-queue").String()
+	pushMetricsBaseDir      = kingpin.Flag("pushmetrics.base-dir", "Base directory for push metrics related files (queue, cache, etc.)").Envar("PING_PUSHMETRICS_BASE_DIR").Default("/var/lib/ping_exporter").String()
+	pushMetricsQueueDir     = kingpin.Flag("pushmetrics.queue-dir", "Persistent metrics queue directory; must not be shared between processes").Default("").String()
 	pushMetricsMaxDiskUsage = kingpin.Flag("pushmetrics.max-disk-usage", "Maximum queued payload bytes; new snapshots are dropped when full").Default("1073741824").Int64()
 	pushMetricsMaxInmemory  = kingpin.Flag("pushmetrics.max-inmemory-requests", "Maximum in-memory batches before spilling to disk (0 always uses disk)").Default("100").Int()
 )
@@ -105,6 +106,12 @@ func main() {
 		}
 	}
 	kingpin.MustParse(kingpin.CommandLine.Parse(args))
+
+	// Initialize pushMetricsQueueDir from base directory if not explicitly set
+	if *pushMetricsQueueDir == "" {
+		queueDir := filepath.Join(*pushMetricsBaseDir, "pushmetrics-queue")
+		pushMetricsQueueDir = &queueDir
+	}
 
 	if *showVersion {
 		printVersion()
