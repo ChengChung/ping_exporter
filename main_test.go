@@ -4,10 +4,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -15,8 +17,140 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alecthomas/kingpin/v2"
 	"github.com/czerwonk/ping_exporter/config"
 )
+
+func TestEnvironmentFlagProcess(t *testing.T) {
+	if os.Getenv("PING_EXPORTER_TEST_FLAGS") != "1" {
+		return
+	}
+	var args []string
+	if err := json.Unmarshal([]byte(os.Getenv("PING_EXPORTER_TEST_ARGS")), &args); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := kingpin.CommandLine.Parse(args); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	values := make(map[string]interface{})
+	for _, flag := range kingpin.CommandLine.Model().Flags {
+		values[flag.Name] = flag.Value.String()
+	}
+	values["pushmetrics.url"] = *pushMetricsURLs
+	values["pushmetrics.extraLabel"] = *pushMetricsExtraLabels
+	values["targets"] = *targetFlag
+	if err := json.NewEncoder(os.Stdout).Encode(values); err != nil {
+		t.Fatal(err)
+	}
+	os.Exit(0)
+}
+
+func TestEnvironmentFlags(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := func(t *testing.T, env map[string]string, args []string, want map[string]interface{}, wantError bool) {
+		t.Helper()
+		encodedArgs, err := json.Marshal(args)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command(executable, "-test.run=^TestEnvironmentFlagProcess$")
+		for _, entry := range os.Environ() {
+			if !strings.HasPrefix(entry, "PING_") && !strings.HasPrefix(entry, "CONFIG_FILE=") && !strings.HasPrefix(entry, "CMD_FLAGS=") {
+				cmd.Env = append(cmd.Env, entry)
+			}
+		}
+		cmd.Env = append(cmd.Env, "PING_EXPORTER_TEST_FLAGS=1", "PING_EXPORTER_TEST_ARGS="+string(encodedArgs))
+		for key, value := range env {
+			cmd.Env = append(cmd.Env, key+"="+value)
+		}
+		output, err := cmd.CombinedOutput()
+		if wantError {
+			if err == nil {
+				t.Fatalf("invalid environment accepted: %s", output)
+			}
+			return
+		}
+		if err != nil {
+			t.Fatalf("parse flags: %v\n%s", err, output)
+		}
+		var got map[string]interface{}
+		if err := json.Unmarshal(output, &got); err != nil {
+			t.Fatalf("decode output: %v\n%s", err, output)
+		}
+		for name, value := range want {
+			if !reflect.DeepEqual(got[name], value) {
+				t.Errorf("%s = %#v, want %#v", name, got[name], value)
+			}
+		}
+	}
+	env := map[string]string{
+		"PING_LISTEN_ADDRESS": "127.0.0.1:19427", "PING_METRICS_PATH": "/custom",
+		"PING_METRICS_TOKEN": "test-token", "PING_TLS_ENABLED": "true",
+		"PING_TLS_CERT_FILE": "/tmp/cert.pem", "PING_TLS_KEY_FILE": "/tmp/key.pem",
+		"PING_TLS_MUTUAL_AUTH": "true", "PING_TLS_CA_FILE": "/tmp/ca.pem",
+		"PING_CONFIG_FILE": "/tmp/config with spaces.yml", "CONFIG_FILE": "/tmp/legacy.yml",
+		"PING_CONFIG_REFRESH": "2m", "PING_INTERVAL": "3s", "PING_TIMEOUT": "2s",
+		"PING_SIZE": "64", "PING_FW_MARK": "7", "PING_HISTORY_SIZE": "25",
+		"PING_DNS_REFRESH": "3m", "PING_DNS_NAMESERVER": "127.0.0.1:53", "PING_DNS_TIMEOUT": "1s",
+		"PING_DISABLE_IPV6": "true", "PING_DISABLE_IPV4": "true", "PING_LOG_LEVEL": "debug",
+		"PING_PUSHMETRICS_INTERVAL": "20s", "PING_PUSHMETRICS_TIMEOUT": "8s",
+		"PING_PUSHMETRICS_BASE_DIR": "/tmp/data", "PING_PUSHMETRICS_QUEUE_DIR": "/tmp/queue",
+		"PING_PUSHMETRICS_MAX_DISK_USAGE": "2048", "PING_PUSHMETRICS_MAX_INMEMORY": "0",
+		"PING_METRICS_DEPRECATED": "enable", "PING_METRICS_RTTUNIT": "both",
+		"PING_PUSHMETRICS_URLS":   " http://first/import ; https://second/import ",
+		"PING_PUSHMETRICS_LABELS": ` site="test site" ; job="ping" `,
+		"PING_TARGETS":            "127.0.0.1  ::1",
+	}
+	t.Run("all documented variables", func(t *testing.T) {
+		run(t, env, nil, map[string]interface{}{
+			"web.listen-address": "127.0.0.1:19427", "web.telemetry-path": "/custom",
+			"web.token": "test-token", "web.tls.enabled": "true",
+			"web.tls.cert-file": "/tmp/cert.pem", "web.tls.key-file": "/tmp/key.pem",
+			"web.tls.mutual-auth-enabled": "true", "web.tls.ca-file": "/tmp/ca.pem",
+			"config.path": "/tmp/config with spaces.yml", "config.refresh": "2m0s",
+			"ping.interval": "3s", "ping.timeout": "2s", "ping.size": "64",
+			"ping.fw-mark": "7", "ping.history-size": "25", "dns.refresh": "3m0s",
+			"dns.nameserver": "127.0.0.1:53", "dns.timeout": "1s",
+			"options.disable-ipv6": "true", "options.disable-ipv4": "true", "log.level": "debug",
+			"pushmetrics.interval": "20s", "pushmetrics.timeout": "8s",
+			"pushmetrics.base-dir": "/tmp/data", "pushmetrics.queue-dir": "/tmp/queue",
+			"pushmetrics.max-disk-usage": "2048", "pushmetrics.max-inmemory-requests": "0",
+			"metrics.deprecated": "enable", "metrics.rttunit": "both",
+			"pushmetrics.url":        []interface{}{"http://first/import", "https://second/import"},
+			"pushmetrics.extraLabel": []interface{}{`site="test site"`, `job="ping"`},
+			"targets":                []interface{}{"127.0.0.1", "::1"},
+		}, false)
+	})
+	t.Run("command line wins", func(t *testing.T) {
+		run(t, env, []string{
+			"--config.path=/cli.yml", "--web.listen-address=:9999", "--no-web.tls.enabled",
+			"--config.refresh=5s", "--pushmetrics.url=http://cli/a;b",
+			"--pushmetrics.url=http://cli/second", `--pushmetrics.extraLabel=site="cli"`, "localhost",
+		}, map[string]interface{}{
+			"config.path": "/cli.yml", "web.listen-address": ":9999", "web.tls.enabled": "false",
+			"config.refresh": "5s", "pushmetrics.url": []interface{}{"http://cli/a;b", "http://cli/second"},
+			"pushmetrics.extraLabel": []interface{}{`site="cli"`}, "targets": []interface{}{"localhost"},
+		}, false)
+	})
+	t.Run("legacy config variable", func(t *testing.T) {
+		run(t, map[string]string{"CONFIG_FILE": "/legacy.yml"}, nil, map[string]interface{}{"config.path": "/legacy.yml"}, false)
+	})
+	t.Run("unchanged defaults", func(t *testing.T) {
+		run(t, nil, nil, map[string]interface{}{
+			"config.path": "", "web.listen-address": ":9427", "config.refresh": "1m0s",
+			"ping.timeout": "4s", "pushmetrics.url": nil, "targets": nil,
+		}, false)
+	})
+	for _, name := range []string{"PING_CONFIG_REFRESH", "PING_TLS_ENABLED", "PING_PUSHMETRICS_MAX_DISK_USAGE", "PING_PUSHMETRICS_MAX_INMEMORY"} {
+		t.Run("invalid "+name, func(t *testing.T) {
+			run(t, map[string]string{name: "invalid"}, nil, nil, true)
+		})
+	}
+}
 
 func preserveConfigFlags(t *testing.T) {
 	t.Helper()

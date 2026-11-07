@@ -1,327 +1,216 @@
 #!/bin/bash
-#
-# ping_exporter systemd 服务安装脚本（简化版）
-# 交互式配置，仅询问必要参数
-#
+# 交互式生成 ping_exporter 的 systemd 服务和环境配置。
 
-set -e
+set -Eeuo pipefail
 
-# 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
-
-# 打印带颜色的消息
-print_info() {
-    echo -e "${BLUE}ℹ${NC} $*"
+die() {
+    printf '错误: %s\n' "$*" >&2
+    exit 1
 }
 
-print_success() {
-    echo -e "${GREEN}✓${NC} $*"
+trim_input() {
+    REPLY=${1%$'\r'}
+    REPLY="${REPLY#"${REPLY%%[![:space:]]*}"}"
+    REPLY="${REPLY%"${REPLY##*[![:space:]]}"}"
 }
 
-print_error() {
-    echo -e "${RED}✗${NC} $*"
-}
-
-print_warning() {
-    echo -e "${YELLOW}⚠${NC} $*"
-}
-
-# 打印标题
-print_title() {
-    echo -e "\n${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${BLUE}$*${NC}"
-    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
-}
-
-# 检查是否为 root
-check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        print_error "此脚本必须以 root 身份运行"
-        exit 1
-    fi
-}
-
-# 询问用户输入
-ask_input() {
-    local prompt=$1
-    local default=$2
-    local input
-
+# 输入通过 REPLY 返回，提示不会进入配置值；EOF 必须终止安装。
+read_input() {
+    local prompt=$1 default=${2:-} line
+    printf '%s' "$prompt" >&2
     if [[ -n "$default" ]]; then
-        echo -ne "${BLUE}?${NC} $prompt [$default]: "
-    else
-        echo -ne "${BLUE}?${NC} $prompt: "
+        printf ' [%s]' "$default" >&2
     fi
-
-    read -r input
-    echo "${input:-$default}"
+    printf ': ' >&2
+    IFS= read -r line || die "输入已结束，安装中止。"
+    trim_input "$line"
+    REPLY=${REPLY:-$default}
 }
 
-# 询问是/否问题
 ask_yes_no() {
-    local prompt=$1
-    local default=$2
-    local input
-
+    local prompt=$1 default=${2:-n}
     while true; do
-        if [[ "$default" == "y" ]]; then
-            echo -ne "${BLUE}?${NC} $prompt [Y/n]: "
-        else
-            echo -ne "${BLUE}?${NC} $prompt [y/N]: "
-        fi
-        read -r input
-        input=${input:-$default}
-
-        case $input in
-            [Yy]) return 0 ;;
-            [Nn]) return 1 ;;
-            *) echo "  请输入 y 或 n" ;;
+        read_input "$prompt (y/n)" "$default"
+        case "$REPLY" in
+            y|Y|yes|YES) return 0 ;;
+            n|N|no|NO) return 1 ;;
+            *) printf '请输入 y 或 n。\n' >&2 ;;
         esac
     done
 }
 
-# 解析多个 URL 并验证
-parse_urls() {
-    local urls_input=$1
-    local urls=()
-
-    IFS=';' read -ra URL_ARRAY <<<"$urls_input"
-    for url in "${URL_ARRAY[@]}"; do
-        url=$(echo "$url" | xargs) # 移除前后空格
-        if [[ -n "$url" ]]; then
-            urls+=("$url")
-        fi
-    done
-
-    printf '%s\n' "${urls[@]}"
-}
-
-# 验证 URL 格式
-validate_url() {
-    local url=$1
-    if [[ $url =~ ^https?:// ]]; then
-        return 0
-    else
+normalize_path() {
+    trim_input "$1"
+    case "$REPLY" in
+        \"*\") REPLY=${REPLY:1:${#REPLY}-2} ;;
+        \'*\') REPLY=${REPLY:1:${#REPLY}-2} ;;
+    esac
+    case "$REPLY" in
+        "~") REPLY=$HOME ;;
+        "~/"*) REPLY="$HOME/${REPLY:2}" ;;
+    esac
+    [[ -n "$REPLY" && "$REPLY" != *[$'\n\r\t']* ]] || {
+        printf '路径不能为空或包含换行、制表符。\n' >&2
         return 1
-    fi
+    }
+    REPLY=$(realpath -m -- "$REPLY") || return 1
 }
 
-# 确认 URLs
-confirm_urls() {
-    local urls=$1
-    print_info "已输入的 Prometheus 推送地址："
-    echo "$urls" | nl -v 1 -w 2 -s '. '
-    echo ""
+validate_executable() {
+    if [[ ! -e "$1" ]]; then
+        printf '文件不存在: %s\n' "$1" >&2
+    elif [[ ! -f "$1" ]]; then
+        printf '不是普通文件: %s\n' "$1" >&2
+    elif [[ ! -x "$1" ]]; then
+        printf '文件存在，但没有执行权限: %s\n' "$1" >&2
+    elif [[ "$1" == *[\"\\]* || "$1" =~ [[:cntrl:]] ]]; then
+        printf 'systemd 不支持可执行文件路径中的双引号、反斜杠或控制字符: %s\n' "$1" >&2
+    else
+        return 0
+    fi
+    return 1
 }
 
-# 主菜单
-main_menu() {
-    print_title "ping_exporter systemd 服务安装配置（简化版）"
+valid_url() {
+    [[ "$1" =~ ^https?://[^/[:space:]?#]+([^[:space:]#]*)?$ ]]
+}
 
-    print_info "仅需配置以下必要参数"
-    echo ""
+normalize_urls() {
+    local remaining=$1 part normalized=""
+    while true; do
+        part=${remaining%%;*}
+        trim_input "$part"
+        valid_url "$REPLY" || {
+            printf '无效的 HTTP(S) 推送地址: %s\n' "$REPLY" >&2
+            return 1
+        }
+        normalized+="${normalized:+;}$REPLY"
+        [[ "$remaining" == *";"* ]] || break
+        remaining=${remaining#*;}
+    done
+    REPLY=$normalized
+}
 
-    # 1. 获取 ping_exporter 可执行文件路径
-    local ping_exporter_path
-    ping_exporter_path=$(ask_input "ping_exporter 可执行文件路径" "/usr/local/bin/ping_exporter")
-    
-    if [[ ! -f "$ping_exporter_path" ]]; then
-        print_warning "文件不存在: $ping_exporter_path"
-        if ! ask_yes_no "继续使用此路径?" "n"; then
-            print_error "安装已取消"
-            exit 1
+valid_listener() {
+    [[ "$1" =~ ^(\[[^]]+\]|[^:[:space:]]*):([0-9]+)$ ]] || return 1
+    local port=${BASH_REMATCH[2]}
+    [[ ${#port} -le 5 ]] && (( 10#$port >= 1 && 10#$port <= 65535 ))
+}
+
+valid_duration() {
+    [[ "$1" =~ ^([0-9]+([.][0-9]+)?(ns|us|ms|s|m|h))+$ && "$1" =~ [1-9] ]]
+}
+
+collect_config() {
+    local default_binary="/usr/local/bin/ping_exporter" candidate
+    if [[ ! -x "$default_binary" ]]; then
+        if candidate=$(type -P ping_exporter); then
+            default_binary=$candidate
+        elif [[ -x "$SCRIPT_DIR/ping_exporter" ]]; then
+            default_binary="$SCRIPT_DIR/ping_exporter"
         fi
     fi
-    echo ""
+    while true; do
+        read_input "ping_exporter 可执行文件路径" "$default_binary"
+        normalize_path "$REPLY" || continue
+        binary=$REPLY
+        validate_executable "$binary" && break
+    done
 
-    # 2. 使用默认的 systemd 和 env 目录
-    local systemd_dir="/etc/systemd/system"
-    local env_file="/etc/default/ping_exporter"
-    
-    if [[ ! -d "$systemd_dir" ]]; then
-        print_error "目录不存在: $systemd_dir"
-        exit 1
-    fi
-    
-    print_success "使用默认配置目录"
-    echo "  • systemd 服务: $systemd_dir/ping_exporter.service"
-    echo "  • 环境变量文件: $env_file"
-    echo ""
-
-    # 3. 获取数据目录 (用于存放队列、缓存等)
-    local data_dir
-    data_dir=$(ask_input "数据文件存储目录" "/var/lib/ping_exporter")
-    
-    # 确保目录存在
-    if [[ ! -d "$data_dir" ]]; then
-        print_info "创建数据目录: $data_dir"
-        mkdir -p "$data_dir"
-        chmod 755 "$data_dir"
-    fi
-    echo ""
-
-    # 4. 获取 Web 服务监听地址
-    local listen_address
-    listen_address=$(ask_input "Web 服务监听地址" "127.0.0.1:9427")
-    echo ""
-
-    # 5. 获取配置文件路径（可选）
-    local config_file
-    config_file=$(ask_input "配置文件路径（留空表示不使用）")
-    echo ""
-
-    # 6. 获取配置刷新间隔
-    local config_refresh
-    config_refresh=$(ask_input "配置刷新间隔" "1m")
-    echo ""
-
-    # 7. 获取 Prometheus 推送地址
-    print_info "请输入 Prometheus 推送地址（多个地址使用分号分隔）"
-    print_info "示例: http://prom1:9091/metrics/job/ping;http://prom2:9091/metrics/job/ping"
-    echo ""
-
-    local pushmetrics_urls
-    local valid=false
-    while [[ $valid == false ]]; do
-        pushmetrics_urls=$(ask_input "推送地址列表")
-        if [[ -z "$pushmetrics_urls" ]]; then
-            print_error "至少需要输入一个地址"
-            continue
+    while true; do
+        read_input "数据文件存储目录" "/var/lib/ping_exporter"
+        normalize_path "$REPLY" || continue
+        data_dir=$REPLY
+        if [[ ! -e "$data_dir" || -d "$data_dir" ]]; then
+            break
         fi
+        printf '该路径存在，但不是目录: %s\n' "$data_dir" >&2
+    done
+    while true; do
+        read_input "Web 监听地址" "127.0.0.1:9427"
+        listen_address=$REPLY
+        valid_listener "$listen_address" && break
+        printf '请输入 host:port 或 [IPv6]:port，端口范围 1-65535。\n' >&2
+    done
 
-        # 验证所有 URL
-        local all_valid=true
-        while IFS= read -r url; do
-            if ! validate_url "$url"; then
-                print_error "无效的 URL 格式: $url"
-                all_valid=false
-            fi
-        done <<<"$(parse_urls "$pushmetrics_urls")"
-
-        if [[ $all_valid == true ]]; then
-            valid=true
-            confirm_urls "$(parse_urls "$pushmetrics_urls")"
+    targets=""
+    while true; do
+        read_input "配置文件路径或 HTTP(S) URL（留空则输入 Ping 目标）"
+        config_file=$REPLY
+        [[ -n "$config_file" ]] || break
+        if [[ "$config_file" == http://* || "$config_file" == https://* ]]; then
+            valid_url "$config_file" && break
+            printf '无效的配置 URL。\n' >&2
+        elif normalize_path "$config_file"; then
+            config_file=$REPLY
+            [[ -f "$config_file" && -r "$config_file" ]] && break
+            printf '配置文件不存在或不可读: %s\n' "$config_file" >&2
         fi
     done
-    echo ""
-
-    # 显示配置总结
-    show_summary "$ping_exporter_path" "$systemd_dir" "$env_file" "$data_dir" "$listen_address" \
-        "$config_file" "$config_refresh" "$pushmetrics_urls"
+    if [[ -z "$config_file" ]]; then
+        while true; do
+            read_input "Ping 目标（IP 或域名，空格分隔）"
+            targets=$REPLY
+            [[ -n "$targets" ]] && break
+            printf '未指定配置文件时，至少需要一个 Ping 目标。\n' >&2
+        done
+    fi
+    while true; do
+        read_input "远程配置刷新间隔" "1m"
+        config_refresh=$REPLY
+        valid_duration "$config_refresh" && break
+        printf '请输入正数时长，例如 30s、1m 或 1m30s。\n' >&2
+    done
+    while true; do
+        read_input "Prometheus 文本导入 URL（分号分隔，留空禁用推送）"
+        push_urls=$REPLY
+        [[ -n "$push_urls" ]] || break
+        if normalize_urls "$push_urls"; then
+            push_urls=$REPLY
+            break
+        fi
+    done
 }
 
-# 显示配置总结
-show_summary() {
-    local ping_exporter_path=$1
-    local systemd_dir=$2
-    local env_file=$3
-    local data_dir=$4
-    local listen_address=$5
-    local config_file=$6
-    local config_refresh=$7
-    local pushmetrics_urls=$8
-
-    print_title "配置总结"
-
-    echo "文件位置："
-    echo "  • ping_exporter: $ping_exporter_path"
-    echo "  • systemd 文件: $systemd_dir/ping_exporter.service"
-    echo "  • 环境文件: $env_file"
-    echo ""
-
-    echo "数据存储目录："
-    echo "  • 基础目录: $data_dir"
-    echo "  • 队列目录: $data_dir/pushmetrics-queue"
-    echo "  • 缓存目录: $data_dir/config-cache"
-    echo ""
-
-    echo "必要参数："
-    echo "  • Web 监听地址: $listen_address"
-    if [[ -n "$config_file" ]]; then
-        echo "  • 配置文件: $config_file"
-    else
-        echo "  • 配置文件: （未使用）"
-    fi
-    echo "  • 配置刷新间隔: $config_refresh"
-    echo ""
-
-    echo "推送地址："
-    echo "$pushmetrics_urls" | nl -v 1 -w 2 -s '. '
-    echo ""
-
-    if ! ask_yes_no "确认安装上述配置?" "y"; then
-        print_error "安装已取消"
-        exit 1
-    fi
-
-    # 执行安装
-    install_config "$ping_exporter_path" "$systemd_dir" "$env_file" "$data_dir" "$listen_address" \
-        "$config_file" "$config_refresh" "$pushmetrics_urls"
+# EnvironmentFile 不是 shell 脚本；双引号转义保留空格和字面量。
+env_entry() {
+    local value=$2
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    value=${value//\$/\\\$}
+    value=${value//\`/\\\`}
+    printf '%s="%s"\n' "$1" "$value"
 }
 
-# 安装配置文件
-install_config() {
-    local ping_exporter_path=$1
-    local systemd_dir=$2
-    local env_file=$3
-    local data_dir=$4
-    local listen_address=$5
-    local config_file=$6
-    local config_refresh=$7
-    local pushmetrics_urls=$8
-
-    echo ""
-    print_title "安装配置文件"
-
-    # 创建数据目录及其子目录
-    print_info "创建数据存储目录..."
-    mkdir -p "$data_dir/pushmetrics-queue"
-    mkdir -p "$data_dir/config-cache"
-    chmod 755 "$data_dir"
-    chmod 755 "$data_dir/pushmetrics-queue"
-    chmod 755 "$data_dir/config-cache"
-    print_success "数据目录已创建"
-    echo ""
-
-    # 创建环境变量文件
-    print_info "创建环境变量文件: $env_file"
-
-    cat >"$env_file" <<EOF
-# ping_exporter 环境变量配置
-# Generated: $(date)
-
-# ===== Web 服务器配置 =====
-PING_LISTEN_ADDRESS=$listen_address
-
-# ===== 配置文件相关 =====
-EOF
-
-    if [[ -n "$config_file" ]]; then
-        echo "PING_CONFIG_FILE=$config_file" >> "$env_file"
+backup_file() {
+    local path=$1 backup
+    if [[ -e "$path" ]]; then
+        [[ -f "$path" && ! -L "$path" ]] || die "拒绝覆盖非普通文件或符号链接: $path"
+        backup=$(mktemp "$path.bak.XXXXXX")
+        cp -p -- "$path" "$backup"
+        printf '已备份: %s\n' "$backup"
+    elif [[ -L "$path" ]]; then
+        die "拒绝覆盖符号链接: $path"
     fi
-    echo "PING_CONFIG_REFRESH=$config_refresh" >> "$env_file"
+}
 
-    cat >>"$env_file" <<EOF
-
-# ===== 推送指标配置 =====
-PING_PUSHMETRICS_BASE_DIR=$data_dir
-PING_PUSHMETRICS_URLS=$pushmetrics_urls
-
-EOF
-
-    chmod 644 "$env_file"
-    print_success "环境变量文件已创建"
-    echo ""
-
-    # 创建 systemd 服务文件
-    local systemd_service="$systemd_dir/ping_exporter.service"
-    print_info "创建 systemd 服务文件: $systemd_service"
-
-    cat >"$systemd_service" <<EOF
+install_config() (
+    local env_tmp="" unit_tmp=""
+    trap 'rm -f -- "$env_tmp" "$unit_tmp"' EXIT
+    mkdir -p -- "$systemd_dir" "$(dirname "$env_file")"
+    env_tmp=$(mktemp "$env_file.tmp.XXXXXX")
+    unit_tmp=$(mktemp "$systemd_dir/ping_exporter.XXXXXX.service")
+    {
+        printf '# Generated by install_systemd.sh\n'
+        env_entry PING_LISTEN_ADDRESS "$listen_address"
+        env_entry PING_CONFIG_FILE "$config_file"
+        env_entry PING_TARGETS "$targets"
+        env_entry PING_CONFIG_REFRESH "$config_refresh"
+        env_entry PING_PUSHMETRICS_BASE_DIR "$data_dir"
+        env_entry PING_PUSHMETRICS_URLS "$push_urls"
+    } >"$env_tmp"
+    {
+        cat <<'UNIT'
 [Unit]
 Description=Ping Exporter - Prometheus Ping Monitor
 Documentation=https://github.com/ChengChung/ping_exporter
@@ -331,143 +220,73 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-EnvironmentFile=$env_file
-ExecStart=$ping_exporter_path
+UNIT
+        # EnvironmentFile 是单一路径，不能套用 ExecStart 的命令行引号。
+        printf 'EnvironmentFile=%s\n' "${env_file//%/%%}"
+        printf 'ExecStart="%s"\n' "${binary//%/%%}"
+        cat <<'UNIT'
 Restart=on-failure
-RestartSec=10
+RestartSec=10s
 StandardOutput=journal
 StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
-EOF
-
-    chmod 644 "$systemd_service"
-    print_success "systemd 服务文件已创建"
-    echo ""
-    
-    # 提示用户后续操作
-    print_title "安装完成"
-    print_success "所有配置文件已生成"
-    echo ""
-    echo "下一步操作："
-    echo ""
-    echo "1. 加载 systemd 配置："
-    echo "   $ sudo systemctl daemon-reload"
-    echo ""
-    echo "2. 启动 ping_exporter 服务："
-    echo "   $ sudo systemctl start ping_exporter"
-    echo ""
-    echo "3. 设置开机自启（可选）："
-    echo "   $ sudo systemctl enable ping_exporter"
-    echo ""
-    echo "4. 查看服务状态："
-    echo "   $ sudo systemctl status ping_exporter"
-    echo ""
-    echo "5. 查看实时日志："
-    echo "   $ sudo journalctl -u ping_exporter -f"
-    echo ""
-    echo "配置文件位置："
-    echo "  • systemd: $systemd_service"
-    echo "  • 环境文件: $env_file"
-    echo "  • 数据目录: $data_dir"
-    echo ""
-}
-ExecStart=$ping_exporter_path
-Restart=on-failure
-RestartSec=5s
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    chmod 644 "$systemd_service"
-    print_success "systemd 服务文件已创建"
-    echo ""
-
-    # 重新加载 systemd
-    print_info "重新加载 systemd 配置..."
-    systemctl daemon-reload
-    print_success "systemd 配置已重新加载"
-    echo ""
-
-    # 启用服务
-    if ask_yes_no "立即启用并启动服务?" "y"; then
-        systemctl enable ping_exporter.service
-        print_success "服务已启用"
-
-        if systemctl start ping_exporter.service; then
-            print_success "服务已启动"
-            echo ""
-            sleep 2
-            show_status
-        else
-            print_error "服务启动失败，请检查日志"
-            systemctl status ping_exporter.service
-        fi
+UNIT
+    } >"$unit_tmp"
+    chmod 600 "$env_tmp"
+    chmod 644 "$unit_tmp"
+    systemd-analyze verify "$unit_tmp" || die "systemd 服务文件校验失败，原配置未覆盖。"
+    backup_file "$env_file"
+    backup_file "$systemd_dir/ping_exporter.service"
+    install -d -m 755 -- "$data_dir" "$data_dir/pushmetrics-queue" "$data_dir/config-cache"
+    mv -f -- "$env_tmp" "$env_file"
+    mv -f -- "$unit_tmp" "$systemd_dir/ping_exporter.service"
+    systemctl daemon-reload || die "配置已写入，但 systemd 重载失败。请检查上述错误及备份。"
+    if [[ "$start_service" == y ]]; then
+        systemctl enable ping_exporter.service || die "服务启用失败。"
+        systemctl restart ping_exporter.service || die "服务启动失败，请运行 journalctl -u ping_exporter -n 50。"
+        sleep 1
+        systemctl is-active --quiet ping_exporter.service || die "服务未保持运行，请运行 journalctl -u ping_exporter -n 50。"
+        printf '服务已启用并启动。\n'
+    else
+        printf '配置已保存，未启动或重启服务。\n'
     fi
+)
 
-    echo ""
-    print_title "安装完成"
-    show_next_steps "$systemd_service" "$env_file"
-}
-
-# 显示服务状态
-show_status() {
-    print_info "服务状态："
-    echo ""
-    systemctl status ping_exporter.service --no-pager || true
-}
-
-# 显示后续步骤
-show_next_steps() {
-    local systemd_service=$1
-    local env_file=$2
-
-    echo "后续步骤："
-    echo ""
-    echo "  1. 查看服务状态:"
-    echo "     ${BLUE}sudo systemctl status ping_exporter${NC}"
-    echo ""
-    echo "  2. 查看实时日志:"
-    echo "     ${BLUE}sudo journalctl -u ping_exporter -f${NC}"
-    echo ""
-    echo "  3. 修改配置:"
-    echo "     ${BLUE}sudo vim $env_file${NC}"
-    echo "     ${BLUE}sudo systemctl restart ping_exporter${NC}"
-    echo ""
-    echo "配置文件说明:"
-    echo ""
-    echo "  • 环境变量文件: $env_file"
-    echo "    - 修改参数后需要重启服务"
-    echo ""
-    echo "  • systemd 服务文件: $systemd_service"
-    echo "    - 通常无需修改"
-    echo ""
-}
-
-# 主程序入口
 main() {
-    print_title "ping_exporter systemd 安装脚本（简化版）"
-
-    # 检查 root 权限
-    check_root
-
-    # 检查依赖
-    for cmd in systemctl grep sed; do
-        if ! command -v "$cmd" &>/dev/null; then
-            print_error "缺少必要的命令: $cmd"
-            exit 1
-        fi
+    [[ $# -eq 0 ]] || die "使用方法: sudo bash $0"
+    [[ $EUID -eq 0 ]] || die "请使用 sudo bash $0 运行。"
+    local cmd help
+    for cmd in systemctl systemd-analyze realpath mktemp install cp mv chmod mkdir dirname sleep cat rm; do
+        command -v "$cmd" >/dev/null || die "缺少必要命令: $cmd"
     done
+    [[ -d /run/systemd/system ]] || die "当前系统未运行 systemd。"
+    SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+    systemd_dir=/etc/systemd/system
+    env_file=/etc/default/ping_exporter
+    printf 'ping_exporter systemd 安装向导\n输入支持绝对路径、相对路径、~/ 路径和成对引号。\n'
+    collect_config
+    help=$("$binary" --help 2>&1) || die "无法执行 $binary --help，请检查程序格式、架构及依赖。"
+    [[ "$help" == *PING_LISTEN_ADDRESS* && "$help" == *PING_TARGETS* && "$help" == *PING_PUSHMETRICS_URLS* ]] ||
+        die "该程序不支持所需的 PING_* 环境变量，请先重新编译并更新可执行文件。"
 
-    # 运行主菜单
-    main_menu
+    printf '\n配置总结:\n  程序: %s\n  数据目录: %s\n  监听: %s\n  配置: %s\n  目标: %s\n  刷新间隔: %s\n  推送: %s\n' \
+        "$binary" "$data_dir" "$listen_address" "${config_file:-无}" "${targets:-由配置文件提供}" "$config_refresh" "${push_urls:-禁用}"
+    printf '  服务: %s/ping_exporter.service\n  环境文件: %s\n已有配置将备份后替换。\n' "$systemd_dir" "$env_file"
+    if ! ask_yes_no "确认安装上述配置?" n; then
+        printf '安装已取消，未写入配置。\n'
+        return
+    fi
+    start_service=n
+    if ask_yes_no "立即启用并启动（已运行则重启）服务?" y; then
+        start_service=y
+    fi
+    install_config
+    printf '\n安装完成。\n修改参数: sudoedit %s\n启动/应用修改: sudo systemctl restart ping_exporter\n开机自启: sudo systemctl enable ping_exporter\n查看状态: sudo systemctl status ping_exporter --no-pager\n查看日志: sudo journalctl -u ping_exporter -f\n' "$env_file"
 }
 
-# 如果脚本被直接执行（不是 sourced）
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    trap 'printf "安装失败（第 %s 行），请检查上述错误。\n" "$LINENO" >&2' ERR
     main "$@"
 fi

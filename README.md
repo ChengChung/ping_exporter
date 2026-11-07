@@ -75,7 +75,8 @@ built-in values without changing the address being pinged. Global labels and
 target labels are reloaded with the configuration. Pushmetrics extra labels,
 when configured, take precedence for pushed metrics only.
 
-`--config.path` (or `CONFIG_FILE`) also accepts an HTTP or HTTPS URL:
+`--config.path` (or `PING_CONFIG_FILE`, with legacy `CONFIG_FILE` as a fallback)
+also accepts an HTTP or HTTPS URL:
 
 ```console
 $ ./ping_exporter --config.path=https://example.com/ping.yml --config.refresh=30s
@@ -133,6 +134,58 @@ Getting the results for testing via cURL:
 ```console
 $ curl http://localhost:9427/metrics
 ```
+
+### Environment variables and systemd
+
+The flags also accept the `PING_*` environment variables documented in
+[ping_exporter.env.example](ping_exporter.env.example). Explicit command-line
+values override environment values, which override built-in defaults.
+`PING_CONFIG_FILE` takes precedence over the legacy `CONFIG_FILE` variable.
+Configuration-file settings retain their existing precedence over flag defaults.
+
+`PING_TARGETS` is a whitespace-separated list used when positional targets are
+absent. `PING_PUSHMETRICS_URLS` and `PING_PUSHMETRICS_LABELS` are semicolon-separated
+lists; surrounding whitespace is trimmed. Explicit repeated flags replace the
+corresponding environment list rather than appending to it. To use a literal
+semicolon inside a URL or label, use command-line flags instead.
+
+```console
+$ PING_TARGETS="127.0.0.1 ::1" PING_LISTEN_ADDRESS=127.0.0.1:9427 ./ping_exporter
+```
+
+For an interactive installation on a Linux host running systemd:
+
+```console
+$ go build -o ping_exporter .
+$ sudo bash ./install_systemd.sh
+```
+
+Rebuild/update the executable first: older binaries do not read these environment
+variables. The installer checks for this support and accepts absolute or relative
+executable paths, `~/` paths, surrounding quotes, and paths containing spaces.
+It requires an existing executable, and either a readable local configuration,
+an HTTP(S) configuration URL, or explicit Ping targets. Pushing is optional.
+Remote configuration contents are checked by the exporter at startup, not fetched
+by the installer.
+
+After confirmation, the installer validates the unit with `systemd-analyze`,
+backs up existing files, and writes:
+
+- `/etc/systemd/system/ping_exporter.service` (mode `0644`, runs as root for ICMP).
+- `/etc/default/ping_exporter` (mode `0600`, systemd environment-file syntax).
+
+No configuration is written before confirmation. You choose whether to enable
+and start/restart the service; declining leaves an existing service running with
+its previous configuration until restarted. Existing environment files are
+backed up, not merged; reapply any extra settings from the backup.
+Edit `/etc/default/ping_exporter` and run `sudo systemctl restart ping_exporter`
+to apply subsequent parameter changes. Inspect failures with
+`sudo journalctl -u ping_exporter -n 50`.
+
+The equivalent launcher is `sudo bash ./quick_start.sh`; use
+`bash ./quick_start.sh --help` for instructions. Isolated installer regression
+tests run with `bash ./install_systemd_test.sh` (requires `systemd-analyze`, but
+does not require a running systemd daemon or change host services).
 
 ### Pushing metrics
 

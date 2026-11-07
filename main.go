@@ -50,47 +50,61 @@ const (
 
 var (
 	showVersion             = kingpin.Flag("version", "Print version information").Default().Bool()
-	listenAddress           = kingpin.Flag("web.listen-address", "Address on which to expose metrics and web interface").Default(":9427").String()
-	metricsPath             = kingpin.Flag("web.telemetry-path", "Path under which to expose metrics").Default("/metrics").String()
-	metricsToken            = kingpin.Flag("web.token", "Token (in http request headers of queries) which to expose metrics").Default("").String()
-	serverUseTLS            = kingpin.Flag("web.tls.enabled", "Enable TLS for web server, default is false").Default().Bool()
-	serverTLSCertFile       = kingpin.Flag("web.tls.cert-file", "The certificate file for the web server").Default("").String()
-	serverTLSKeyFile        = kingpin.Flag("web.tls.key-file", "The key file for the web server").Default("").String()
-	serverMutualAuthEnabled = kingpin.Flag("web.tls.mutual-auth-enabled", "Enable TLS client mutual authentication, default is false").Default().Bool()
-	serverTLSCAFile         = kingpin.Flag("web.tls.ca-file", "The certificate authority file for client's certificate verification").Default("").String()
-	configFile              = kingpin.Flag("config.path", "Path or HTTP(S) URL to config file").Envar("CONFIG_FILE").Default("").String()
-	configRefresh           = kingpin.Flag("config.refresh", "Polling interval for HTTP(S) config URLs (must be greater than 0)").Default("1m").Duration()
-	pingInterval            = kingpin.Flag("ping.interval", "Interval for ICMP echo requests").Default("5s").Duration()
-	pingTimeout             = kingpin.Flag("ping.timeout", "Timeout for ICMP echo request").Default("4s").Duration()
-	pingSize                = kingpin.Flag("ping.size", "Payload size for ICMP echo requests").Default("56").Uint16()
-	firewallMark            = kingpin.Flag("ping.fw-mark", "set socket mark (SO_MARK) to this value").Default("0").Uint()
-	historySize             = kingpin.Flag("ping.history-size", "Number of results to remember per target").Default("10").Int()
-	dnsRefresh              = kingpin.Flag("dns.refresh", "Interval for refreshing DNS records and updating targets accordingly (0 if disabled)").Default("1m").Duration()
-	dnsNameServer           = kingpin.Flag("dns.nameserver", "DNS server used to resolve hostname of targets").Default("").String()
-	dnsLookupTimeout        = kingpin.Flag("dns.timeout", "Timeout for DNS resolution").Default("0s").Duration()
-	disableIPv6             = kingpin.Flag("options.disable-ipv6", "Disable DNS from resolving IPv6 AAAA records").Default().Bool()
-	disableIPv4             = kingpin.Flag("options.disable-ipv4", "Disable DNS from resolving IPv4 A records").Default().Bool()
-	logLevel                = kingpin.Flag("log.level", "Only log messages with the given severity or above. Valid levels: [debug, info, warn, error, fatal]").Default("info").String()
-	targetFlag              = kingpin.Arg("targets", "A list of targets to ping").Strings()
-	pushMetricsURLs         = kingpin.Flag("pushmetrics.url", "HTTP(S) Prometheus text import endpoint (repeatable, empty disables pushing)").Strings()
-	pushMetricsExtraLabels  = kingpin.Flag("pushmetrics.extraLabel", "Extra label for pushed metrics in name=\"value\" format; repeatable, overrides existing labels").Strings()
-	pushMetricsInterval     = kingpin.Flag("pushmetrics.interval", "Metrics snapshot and retry interval").Default("10s").Duration()
-	pushMetricsTimeout      = kingpin.Flag("pushmetrics.timeout", "Timeout for each metrics push request").Default("10s").Duration()
+	listenAddress           = kingpin.Flag("web.listen-address", "Address on which to expose metrics and web interface").Envar("PING_LISTEN_ADDRESS").Default(":9427").String()
+	metricsPath             = kingpin.Flag("web.telemetry-path", "Path under which to expose metrics").Envar("PING_METRICS_PATH").Default("/metrics").String()
+	metricsToken            = kingpin.Flag("web.token", "Token (in http request headers of queries) which to expose metrics").Envar("PING_METRICS_TOKEN").Default("").String()
+	serverUseTLS            = kingpin.Flag("web.tls.enabled", "Enable TLS for web server, default is false").Envar("PING_TLS_ENABLED").Default().Bool()
+	serverTLSCertFile       = kingpin.Flag("web.tls.cert-file", "The certificate file for the web server").Envar("PING_TLS_CERT_FILE").Default("").String()
+	serverTLSKeyFile        = kingpin.Flag("web.tls.key-file", "The key file for the web server").Envar("PING_TLS_KEY_FILE").Default("").String()
+	serverMutualAuthEnabled = kingpin.Flag("web.tls.mutual-auth-enabled", "Enable TLS client mutual authentication, default is false").Envar("PING_TLS_MUTUAL_AUTH").Default().Bool()
+	serverTLSCAFile         = kingpin.Flag("web.tls.ca-file", "The certificate authority file for client's certificate verification").Envar("PING_TLS_CA_FILE").Default("").String()
+	configFile              = kingpin.Flag("config.path", "Path or HTTP(S) URL to config file (CONFIG_FILE is a legacy fallback)").Envar("PING_CONFIG_FILE").Default(os.Getenv("CONFIG_FILE")).String()
+	configRefresh           = kingpin.Flag("config.refresh", "Polling interval for HTTP(S) config URLs (must be greater than 0)").Envar("PING_CONFIG_REFRESH").Default("1m").Duration()
+	pingInterval            = kingpin.Flag("ping.interval", "Interval for ICMP echo requests").Envar("PING_INTERVAL").Default("5s").Duration()
+	pingTimeout             = kingpin.Flag("ping.timeout", "Timeout for ICMP echo request").Envar("PING_TIMEOUT").Default("4s").Duration()
+	pingSize                = kingpin.Flag("ping.size", "Payload size for ICMP echo requests").Envar("PING_SIZE").Default("56").Uint16()
+	firewallMark            = kingpin.Flag("ping.fw-mark", "set socket mark (SO_MARK) to this value").Envar("PING_FW_MARK").Default("0").Uint()
+	historySize             = kingpin.Flag("ping.history-size", "Number of results to remember per target").Envar("PING_HISTORY_SIZE").Default("10").Int()
+	dnsRefresh              = kingpin.Flag("dns.refresh", "Interval for refreshing DNS records and updating targets accordingly (0 if disabled)").Envar("PING_DNS_REFRESH").Default("1m").Duration()
+	dnsNameServer           = kingpin.Flag("dns.nameserver", "DNS server used to resolve hostname of targets").Envar("PING_DNS_NAMESERVER").Default("").String()
+	dnsLookupTimeout        = kingpin.Flag("dns.timeout", "Timeout for DNS resolution").Envar("PING_DNS_TIMEOUT").Default("0s").Duration()
+	disableIPv6             = kingpin.Flag("options.disable-ipv6", "Disable DNS from resolving IPv6 AAAA records").Envar("PING_DISABLE_IPV6").Default().Bool()
+	disableIPv4             = kingpin.Flag("options.disable-ipv4", "Disable DNS from resolving IPv4 A records").Envar("PING_DISABLE_IPV4").Default().Bool()
+	logLevel                = kingpin.Flag("log.level", "Only log messages with the given severity or above. Valid levels: [debug, info, warn, error, fatal]").Envar("PING_LOG_LEVEL").Default("info").String()
+	targetFlag              = kingpin.Arg("targets", "A list of targets to ping (defaults to whitespace-separated PING_TARGETS)").Default(strings.Fields(os.Getenv("PING_TARGETS"))...).Strings()
+	pushMetricsURLs         = kingpin.Flag("pushmetrics.url", "HTTP(S) Prometheus text import endpoint (repeatable, defaults to semicolon-separated PING_PUSHMETRICS_URLS)").Default(environmentList("PING_PUSHMETRICS_URLS")...).Strings()
+	pushMetricsExtraLabels  = kingpin.Flag("pushmetrics.extraLabel", "Extra label in name=\"value\" format (repeatable, defaults to semicolon-separated PING_PUSHMETRICS_LABELS)").Default(environmentList("PING_PUSHMETRICS_LABELS")...).Strings()
+	pushMetricsInterval     = kingpin.Flag("pushmetrics.interval", "Metrics snapshot and retry interval").Envar("PING_PUSHMETRICS_INTERVAL").Default("10s").Duration()
+	pushMetricsTimeout      = kingpin.Flag("pushmetrics.timeout", "Timeout for each metrics push request").Envar("PING_PUSHMETRICS_TIMEOUT").Default("10s").Duration()
 	pushMetricsBaseDir      = kingpin.Flag("pushmetrics.base-dir", "Base directory for push metrics related files (queue, cache, etc.)").Envar("PING_PUSHMETRICS_BASE_DIR").Default("/var/lib/ping_exporter").String()
-	pushMetricsQueueDir     = kingpin.Flag("pushmetrics.queue-dir", "Persistent metrics queue directory; must not be shared between processes").Default("").String()
-	pushMetricsMaxDiskUsage = kingpin.Flag("pushmetrics.max-disk-usage", "Maximum queued payload bytes; new snapshots are dropped when full").Default("1073741824").Int64()
-	pushMetricsMaxInmemory  = kingpin.Flag("pushmetrics.max-inmemory-requests", "Maximum in-memory batches before spilling to disk (0 always uses disk)").Default("100").Int()
+	pushMetricsQueueDir     = kingpin.Flag("pushmetrics.queue-dir", "Persistent metrics queue directory; must not be shared between processes").Envar("PING_PUSHMETRICS_QUEUE_DIR").Default("").String()
+	pushMetricsMaxDiskUsage = kingpin.Flag("pushmetrics.max-disk-usage", "Maximum queued payload bytes; new snapshots are dropped when full").Envar("PING_PUSHMETRICS_MAX_DISK_USAGE").Default("1073741824").Int64()
+	pushMetricsMaxInmemory  = kingpin.Flag("pushmetrics.max-inmemory-requests", "Maximum in-memory batches before spilling to disk (0 always uses disk)").Envar("PING_PUSHMETRICS_MAX_INMEMORY").Default("100").Int()
 )
 
 var (
 	enableDeprecatedMetrics = true // default may change in future
-	deprecatedMetrics       = kingpin.Flag("metrics.deprecated", "Enable or disable deprecated metrics (`ping_rtt_ms{type=best|worst|mean|std_dev}`). Valid choices: [enable, disable]").Default("disable").String()
+	deprecatedMetrics       = kingpin.Flag("metrics.deprecated", "Enable or disable deprecated metrics (`ping_rtt_ms{type=best|worst|mean|std_dev}`). Valid choices: [enable, disable]").Envar("PING_METRICS_DEPRECATED").Default("disable").String()
 
 	rttMetricsScale  = rttInMills // might change in future
-	rttMode          = kingpin.Flag("metrics.rttunit", "Export ping results as either seconds (default), or milliseconds (deprecated), or both (for migrations). Valid choices: [s, ms, both]").Default("s").String()
+	rttMode          = kingpin.Flag("metrics.rttunit", "Export ping results as either seconds (default), or milliseconds (deprecated), or both (for migrations). Valid choices: [s, ms, both]").Envar("PING_METRICS_RTTUNIT").Default("s").String()
 	desiredTargets   *targets
 	configHTTPClient = &http.Client{Timeout: 10 * time.Second}
 )
+
+// Kingpin splits repeatable environment values on newlines, but our environment
+// files use semicolons. Defaults preserve command-line precedence for lists.
+func environmentList(name string) []string {
+	value := os.Getenv(name)
+	if value == "" {
+		return nil
+	}
+	values := strings.Split(value, ";")
+	for i := range values {
+		values[i] = strings.TrimSpace(values[i])
+	}
+	return values
+}
 
 func main() {
 	desiredTargets = &targets{}
@@ -449,7 +463,7 @@ func startServer(collector *pingCollector) {
 		if err != nil {
 			log.Fatalf("invalid metrics push labels: %v", err)
 		}
-		
+
 		pushWorkers := make([]*pushMetricsWorker, len(*pushMetricsURLs))
 		for idx, url := range *pushMetricsURLs {
 			queueDir := filepath.Join(*pushMetricsQueueDir, strconv.Itoa(idx))
@@ -463,11 +477,11 @@ func startServer(collector *pingCollector) {
 				index:    idx,
 			}
 		}
-		
+
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		go runPushMetricsMulti(ctx, reg, pushWorkers, *pushMetricsInterval, *pushMetricsTimeout, extraLabels)
-		log.Infof("Metrics push enabled for %d endpoint(s) (interval %s, queue directory %s)", 
+		log.Infof("Metrics push enabled for %d endpoint(s) (interval %s, queue directory %s)",
 			len(*pushMetricsURLs), *pushMetricsInterval, *pushMetricsQueueDir)
 	}
 
