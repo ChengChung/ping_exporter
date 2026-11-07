@@ -14,10 +14,67 @@ import (
 	"testing"
 	"time"
 
+	"github.com/czerwonk/ping_exporter/config"
+	mon "github.com/digineo/go-ping/monitor"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	dto "github.com/prometheus/client_model/go"
 	"google.golang.org/protobuf/proto"
 )
+
+func TestPushMetricsUp(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	collector := NewPingCollector(false, rttInSeconds, mon.New(nil, time.Second, time.Second), &config.Config{
+		Labels: map[string]string{"instance": "local", "location": "CN"},
+	})
+	registry.MustRegister(collector)
+	handler := promhttp.HandlerFor(registry, promhttp.HandlerOpts{})
+	before := httptest.NewRecorder()
+	handler.ServeHTTP(before, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if before.Code != http.StatusOK || strings.Contains(before.Body.String(), "# TYPE up ") {
+		t.Fatalf("unexpected scrape response: %s", before.Body.String())
+	}
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(families) != 1 || families[0].GetName() != "ping_up" {
+		t.Fatalf("unexpected gathered metrics: %v", families)
+	}
+	original := proto.Clone(families[0])
+	gatherer := prometheus.GathererFunc(func() ([]*dto.MetricFamily, error) { return families, nil })
+	for _, testCase := range []struct {
+		name        string
+		extraLabels prometheus.Labels
+		wantLabels  string
+	}{
+		{"global_labels", nil, fmt.Sprintf(`instance="local",location="CN",version="%s"`, version)},
+		{"push_overrides", prometheus.Labels{"instance": "remote", "job": "ping"}, fmt.Sprintf(`instance="remote",job="ping",location="CN",version="%s"`, version)},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			for _, now := range []time.Time{time.Unix(1, 0), time.Unix(2, 0)} {
+				data, err := captureMetrics(gatherer, now, testCase.extraLabels)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, name := range []string{"ping_up", "up"} {
+					want := fmt.Sprintf("\n%s{%s} 1 %d\n", name, testCase.wantLabels, now.UnixMilli())
+					if strings.Count(string(data), want) != 1 || !strings.Contains(string(data), "# TYPE "+name+" gauge\n") {
+						t.Fatalf("snapshot must contain one gauge sample %q: %s", want, data)
+					}
+				}
+				if !proto.Equal(families[0], original) {
+					t.Fatal("push snapshot modified original metrics")
+				}
+			}
+		})
+	}
+	after := httptest.NewRecorder()
+	handler.ServeHTTP(after, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if after.Code != http.StatusOK || after.Body.String() != before.Body.String() {
+		t.Fatalf("push changed scrape response: %s", after.Body.String())
+	}
+}
 
 func TestPushMetricsSnapshotTimestamp(t *testing.T) {
 	cases := []struct {
@@ -105,6 +162,9 @@ func TestPushMetricsRecovery(t *testing.T) {
 	registry := prometheus.NewRegistry()
 	gauge := prometheus.NewGauge(prometheus.GaugeOpts{Name: "push_test", Help: "Test metric"})
 	registry.MustRegister(gauge)
+	up := prometheus.NewGauge(prometheus.GaugeOpts{Name: "ping_up", Help: "Exporter status"})
+	up.Set(1)
+	registry.MustRegister(up)
 	queue, err := openMetricsQueue(t.TempDir(), 1<<20, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -158,6 +218,14 @@ func TestPushMetricsRecovery(t *testing.T) {
 	first, second := <-received, <-received
 	if !strings.Contains(first, `push_test{instance="foobar",job="vm"} 1 1000`+"\n") || !strings.Contains(second, `push_test{instance="foobar",job="vm"} 2 2000`+"\n") {
 		t.Fatalf("unexpected replay: %q, %q", first, second)
+	}
+	for index, body := range []string{first, second} {
+		for _, name := range []string{"ping_up", "up"} {
+			want := fmt.Sprintf("\n%s{instance=\"foobar\",job=\"vm\"} 1 %d\n", name, (index+1)*1000)
+			if !strings.Contains(body, want) {
+				t.Fatalf("replayed snapshot missing %q: %s", want, body)
+			}
+		}
 	}
 	entries, err := os.ReadDir(queue.dir)
 	if err != nil || len(entries) != 0 || queue.used != 0 {

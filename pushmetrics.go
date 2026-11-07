@@ -278,6 +278,15 @@ func captureMetrics(gatherer prometheus.Gatherer, now time.Time, extraLabels pro
 	if err != nil {
 		return nil, err
 	}
+	for _, family := range families {
+		if family.GetName() == "ping_up" {
+			up := proto.Clone(family).(*dto.MetricFamily)
+			up.Name = proto.String("up")
+			up.Help = proto.String("Whether the exporter was running at snapshot time")
+			families = append(families, up)
+			break
+		}
+	}
 	timestamp := now.UnixMilli()
 	var data bytes.Buffer
 	for _, family := range families {

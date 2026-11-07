@@ -211,6 +211,14 @@ with the tenant ID). This sends HTTP POST requests with Prometheus text, not
 Prometheus remote_write or the Pushgateway protocol. Both `-pushmetrics.*` and
 `--pushmetrics.*` flags are accepted.
 
+Push snapshots include an additional `up` gauge with value `1`, alongside
+`ping_up`. It carries the same version and global labels as `ping_up`, with
+push extra labels applied to both. `/metrics` remains unchanged and does not
+expose this additional `up` metric. It indicates that the exporter was running
+at snapshot time, not that ping targets are reachable or that delivery succeeded.
+Queued retries preserve its original timestamp; stopping the exporter does not
+send `up = 0`.
+
 | Flag | Default | Description |
 | ---- | ------- | ----------- |
 | `--pushmetrics.url` | empty (disabled) | Full HTTP(S) import URL |
