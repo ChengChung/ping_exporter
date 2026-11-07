@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"io"
 
 	"github.com/czerwonk/ping_exporter/config"
@@ -20,12 +21,22 @@ func (m *pingExporterService) Execute(args []string, r <-chan svc.ChangeRequest,
 
 	changes <- svc.Status{State: svc.StartPending}
 
-	go runInteractive(m.cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- runExporterContext(ctx, m.cfg) }()
 
 	changes <- svc.Status{State: svc.Running, Accepts: cmdsAccepted}
 
 	for {
 		select {
+		case err := <-done:
+			changes <- svc.Status{State: svc.Stopped}
+			if err != nil {
+				log.WithError(err).Error("Exporter stopped")
+				return false, 1
+			}
+			return
 		case c := <-r:
 			switch c.Cmd {
 			case svc.Interrogate:
@@ -33,7 +44,13 @@ func (m *pingExporterService) Execute(args []string, r <-chan svc.ChangeRequest,
 			case svc.Stop, svc.Shutdown:
 				log.Info("Service stop requested")
 				changes <- svc.Status{State: svc.StopPending}
+				cancel()
+				err := <-done
 				changes <- svc.Status{State: svc.Stopped}
+				if err != nil {
+					log.WithError(err).Error("Service shutdown failed")
+					return false, 1
+				}
 				return
 			default:
 				log.Errorf("unexpected control request %d", c)

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -137,6 +138,22 @@ func (queue *metricsQueue) spillMemoryLocked() error {
 		queue.memory[0] = nil
 		queue.memory = queue.memory[1:]
 	}
+	return nil
+}
+
+func (queue *metricsQueue) persist() error {
+	queue.flushMu.Lock()
+	defer queue.flushMu.Unlock()
+	queue.mu.Lock()
+	defer queue.mu.Unlock()
+	if len(queue.memory) == 0 {
+		return nil
+	}
+	queue.diskMode = true
+	if err := queue.spillMemoryLocked(); err != nil {
+		return fmt.Errorf("%d metrics batches remain unpersisted: %w", len(queue.memory), err)
+	}
+	log.Infof("Pending metrics persisted to %s", queue.dir)
 	return nil
 }
 
@@ -304,55 +321,8 @@ func validatePushMetrics(endpoint string, interval, timeout time.Duration) error
 	return nil
 }
 
-func runPushMetrics(ctx context.Context, gatherer prometheus.Gatherer, queue *metricsQueue, endpoint string, interval, timeout time.Duration, extraLabels prometheus.Labels) {
-	client := &http.Client{
-		Timeout: timeout,
-		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
-	defer client.CloseIdleConnections()
-	ready := make(chan struct{}, 1)
-	var workers sync.WaitGroup
-	workers.Add(1)
-	go func() {
-		defer workers.Done()
-		retry := time.NewTicker(interval)
-		defer retry.Stop()
-		for {
-			if err := queue.flush(ctx, client, endpoint); err != nil && ctx.Err() == nil {
-				log.WithError(err).Warn("Metrics push failed; queued data will be retried")
-			}
-			select {
-			case <-ctx.Done():
-				return
-			case <-ready:
-			case <-retry.C:
-			}
-		}
-	}()
-	defer workers.Wait()
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		data, err := captureMetrics(gatherer, time.Now(), extraLabels)
-		if err == nil {
-			err = queue.enqueue(data)
-		}
-		if err != nil {
-			log.WithError(err).Error("Could not queue metrics snapshot")
-		} else {
-			select {
-			case ready <- struct{}{}:
-			default:
-			}
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-	}
+func runPushMetrics(ctx context.Context, gatherer prometheus.Gatherer, queue *metricsQueue, endpoint string, interval, timeout time.Duration, extraLabels prometheus.Labels) error {
+	return runPushMetricsMulti(ctx, gatherer, []*pushMetricsWorker{{endpoint: endpoint, queue: queue}}, interval, timeout, extraLabels)
 }
 
 // pushMetricsWorker represents a single push metrics endpoint with its own queue
@@ -364,9 +334,9 @@ type pushMetricsWorker struct {
 
 // runPushMetricsMulti manages multiple independent push metric workers,
 // each with its own queue ordered by index rather than endpoint value
-func runPushMetricsMulti(ctx context.Context, gatherer prometheus.Gatherer, workers []*pushMetricsWorker, interval, timeout time.Duration, extraLabels prometheus.Labels) {
+func runPushMetricsMulti(ctx context.Context, gatherer prometheus.Gatherer, workers []*pushMetricsWorker, interval, timeout time.Duration, extraLabels prometheus.Labels) (result error) {
 	if len(workers) == 0 {
-		return
+		return nil
 	}
 
 	client := &http.Client{
@@ -385,6 +355,14 @@ func runPushMetricsMulti(ctx context.Context, gatherer prometheus.Gatherer, work
 
 	// Start a flush goroutine for each worker
 	var wg sync.WaitGroup
+	defer func() {
+		wg.Wait()
+		for _, worker := range workers {
+			if err := worker.queue.persist(); err != nil {
+				result = errors.Join(result, fmt.Errorf("persist endpoint #%d queue: %w", worker.index+1, err))
+			}
+		}
+	}()
 	for idx, worker := range workers {
 		wg.Add(1)
 		go func(w *pushMetricsWorker, readyChan chan struct{}) {
@@ -409,6 +387,9 @@ func runPushMetricsMulti(ctx context.Context, gatherer prometheus.Gatherer, work
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
+		if ctx.Err() != nil {
+			return nil
+		}
 		data, err := captureMetrics(gatherer, time.Now(), extraLabels)
 		if err == nil {
 			for idx, worker := range workers {
@@ -426,7 +407,7 @@ func runPushMetricsMulti(ctx context.Context, gatherer prometheus.Gatherer, work
 		}
 		select {
 		case <-ctx.Done():
-			return
+			return nil
 		case <-ticker.C:
 		}
 	}

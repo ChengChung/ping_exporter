@@ -554,28 +554,36 @@ func TestPushMetricsMultipleEndpoints(t *testing.T) {
 	gauge.Set(42)
 
 	// Run the multi-endpoint push metrics function
-	go runPushMetricsMulti(ctx, registry, workers, 100*time.Millisecond, 5*time.Second, nil)
+	done := make(chan error, 1)
+	go func() { done <- runPushMetricsMulti(ctx, registry, workers, 100*time.Millisecond, 5*time.Second, nil) }()
 
 	// Wait a bit for the goroutine to process metrics
 	time.Sleep(500 * time.Millisecond)
 
 	// Verify that all endpoints received requests
-	for i, count := range requestCounts {
-		if count.Load() == 0 {
+	for i := range requestCounts {
+		if requestCounts[i].Load() == 0 {
 			t.Errorf("endpoint %d did not receive any requests", i)
 		}
 	}
 
 	// Cancel context and wait for goroutine to finish
 	cancel()
-	time.Sleep(200 * time.Millisecond)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("push workers did not finish")
+	}
 }
 
 func TestPushMetricsMultipleEndpointIndependentQueues(t *testing.T) {
 	// This test verifies that each endpoint has its own independent queue
 	// by checking that queue directories are created with index-based names
 	tmpDir := t.TempDir()
-	
+
 	queueDirs := []string{
 		filepath.Join(tmpDir, "queue-0"),
 		filepath.Join(tmpDir, "queue-1"),
@@ -615,4 +623,148 @@ func TestPushMetricsMultipleEndpointIndependentQueues(t *testing.T) {
 			t.Errorf("worker %d has nil queue", i)
 		}
 	}
+}
+
+func TestPushMetricsShutdownPersistsAllEndpoints(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(prometheus.NewGauge(prometheus.GaugeOpts{Name: "shutdown_sample", Help: "Test metric"}))
+	started := make(chan int, 4)
+	failed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		select {
+		case started <- 0:
+		default:
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer failed.Close()
+	blocked := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		started <- 1
+		<-r.Context().Done()
+	}))
+	defer blocked.Close()
+	workers := make([]*pushMetricsWorker, 2)
+	for i, endpoint := range []string{failed.URL, blocked.URL} {
+		queue, err := openMetricsQueue(t.TempDir(), 1<<20, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, data := range []string{"first", "second"} {
+			if err := queue.enqueue([]byte(data)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		workers[i] = &pushMetricsWorker{endpoint: endpoint, queue: queue, index: i}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- runPushMetricsMulti(ctx, registry, workers, time.Hour, time.Hour, nil) }()
+	seen := make(map[int]bool)
+	for len(seen) < len(workers) {
+		select {
+		case index := <-started:
+			seen[index] = true
+		case <-time.After(2 * time.Second):
+			t.Fatal("push did not start")
+		}
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdown did not cancel the in-flight request and persist queues")
+	}
+	for _, worker := range workers {
+		assertMetricsQueueState(t, worker.queue, 0, 3)
+		reopened, err := openMetricsQueue(worker.queue.dir, 1<<20, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		received := make(chan string, 3)
+		recovery := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			content, _ := io.ReadAll(r.Body)
+			received <- string(content)
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		err = reopened.flush(context.Background(), recovery.Client(), recovery.URL)
+		recovery.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(received) != 3 {
+			t.Fatalf("recovered %d batches, want 3", len(received))
+		}
+		if first, second, third := <-received, <-received, <-received; first != "first" || second != "second" || !strings.Contains(third, "shutdown_sample") {
+			t.Fatalf("recovered batches lost or reordered: %q, %q, %q", first, second, third)
+		}
+		assertMetricsQueueState(t, reopened, 0, 0)
+	}
+}
+
+func TestPushMetricsShutdownReportsPersistenceFailure(t *testing.T) {
+	full, err := openMetricsQueue(t.TempDir(), 3, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	good, err := openMetricsQueue(t.TempDir(), 1024, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, queue := range []*metricsQueue{full, good} {
+		for _, data := range []string{"one", "two"} {
+			if err := queue.enqueue([]byte(data)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = runPushMetricsMulti(ctx, prometheus.NewRegistry(), []*pushMetricsWorker{
+		{queue: full, index: 0}, {queue: good, index: 1},
+	}, time.Hour, time.Second, nil)
+	if err == nil || !strings.Contains(err.Error(), "endpoint #1") || !strings.Contains(err.Error(), "1 metrics batches remain unpersisted") {
+		t.Fatalf("missing persistence error: %v", err)
+	}
+	assertMetricsQueueState(t, full, 1, 1)
+	assertMetricsQueueState(t, good, 0, 2)
+	full.maxBytes = 1024
+	if err := full.persist(); err != nil {
+		t.Fatal(err)
+	}
+	assertMetricsQueueState(t, full, 0, 2)
+}
+
+func TestPushMetricsShutdownWriteError(t *testing.T) {
+	queue, err := openMetricsQueue(filepath.Join(t.TempDir(), "queue"), 1024, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.enqueue([]byte("retained")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(queue.dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(queue.dir, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.persist(); err == nil {
+		t.Fatal("write error was ignored")
+	}
+	if err := os.Remove(queue.dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(queue.dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	assertMetricsQueueState(t, queue, 1, 0)
+	if err := queue.persist(); err != nil {
+		t.Fatal(err)
+	}
+	assertMetricsQueueState(t, queue, 0, 1)
 }

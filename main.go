@@ -6,16 +6,19 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/digineo/go-ping"
@@ -191,7 +194,7 @@ func main() {
 		kingpin.FatalUsage("ping.size must be between 0 and 65500")
 	}
 
-	if len(cfg.Targets) == 0 {
+	if cfg.Targets == nil {
 		kingpin.FatalUsage("No targets specified")
 	}
 
@@ -199,18 +202,36 @@ func main() {
 }
 
 func runInteractive(cfg *config.Config) {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := runExporterContext(ctx, cfg); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func runExporterContext(ctx context.Context, cfg *config.Config) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	globalResolver := setupGlobalResolver(cfg)
 
-	m, err := startMonitor(cfg, globalResolver)
+	m, err := startMonitor(ctx, cfg, globalResolver)
 	if err != nil {
-		log.Errorln(err)
-		os.Exit(2)
+		return err
 	}
+	defer m.Stop()
 
 	collector := NewPingCollector(enableDeprecatedMetrics, rttMetricsScale, m, cfg)
-	go watchConfig(desiredTargets, globalResolver, m, collector, cfg)
-
-	startServer(collector)
+	watchDone := make(chan error, 1)
+	go func() {
+		err := watchConfig(ctx, desiredTargets, globalResolver, m, collector, cfg)
+		if err != nil {
+			cancel()
+		}
+		watchDone <- err
+	}()
+	err = startServer(ctx, collector)
+	cancel()
+	return errors.Join(err, <-watchDone)
 }
 
 func printVersion() {
@@ -220,7 +241,7 @@ func printVersion() {
 	fmt.Println("Metric exporter for go-icmp")
 }
 
-func startMonitor(cfg *config.Config, globalResolver Resolver) (*mon.Monitor, error) {
+func startMonitor(ctx context.Context, cfg *config.Config, globalResolver Resolver) (*mon.Monitor, error) {
 	var bind4, bind6 string
 	if ln, err := net.Listen("tcp4", "127.0.0.1:0"); err == nil {
 		// ipv4 enabled
@@ -259,10 +280,11 @@ func startMonitor(cfg *config.Config, globalResolver Resolver) (*mon.Monitor, er
 
 	err = upsertTargets(desiredTargets, globalResolver, cfg, monitor)
 	if err != nil {
-		log.Fatalln(err)
+		monitor.Stop()
+		return nil, err
 	}
 
-	go startDNSAutoRefresh(cfg.DNS.Refresh.Duration(), desiredTargets, monitor, cfg)
+	go startDNSAutoRefresh(ctx, cfg.DNS.Refresh.Duration(), desiredTargets, monitor, cfg)
 	return monitor, nil
 }
 
@@ -314,9 +336,9 @@ func upsertTargets(globalTargets *targets, globalResolver Resolver, cfg *config.
 	return nil
 }
 
-func watchConfig(globalTargets *targets, globalResolver Resolver, monitor *mon.Monitor, collector *pingCollector, initial *config.Config) {
+func watchConfig(ctx context.Context, globalTargets *targets, globalResolver Resolver, monitor *mon.Monitor, collector *pingCollector, initial *config.Config) error {
 	if *configFile == "" {
-		return
+		return nil
 	}
 
 	reload := func(cfg *config.Config) error {
@@ -329,13 +351,13 @@ func watchConfig(globalTargets *targets, globalResolver Resolver, monitor *mon.M
 	}
 
 	if isHTTPConfig(*configFile) {
-		watchHTTPConfig(context.Background(), initial, reload)
-		return
+		watchHTTPConfig(ctx, initial, reload)
+		return nil
 	}
 
 	watcher, err := inotify.NewWatcher()
 	if err != nil {
-		log.Fatalf("unable to create file watcher: %v", err)
+		return fmt.Errorf("unable to create file watcher: %w", err)
 	}
 	defer func() {
 		if err := watcher.Close(); err != nil {
@@ -345,16 +367,21 @@ func watchConfig(globalTargets *targets, globalResolver Resolver, monitor *mon.M
 
 	err = watcher.Add(*configFile)
 	if err != nil {
-		log.Fatalf("unable to watch file: %v", err)
+		return fmt.Errorf("unable to watch file: %w", err)
 	}
 	for {
 		select {
-		case event := <-watcher.Events:
+		case <-ctx.Done():
+			return nil
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return fmt.Errorf("config watcher event channel closed")
+			}
 			log.Debugf("Got file inotify event: %s", event)
 			// If the file is removed, the inotify watcher will lose track of the file. Add it again.
 			if event.Op == inotify.Remove {
 				if err = watcher.Add(*configFile); err != nil {
-					log.Fatalf("failed to renew watch for file: %v", err)
+					return fmt.Errorf("failed to renew watch for file: %w", err)
 				}
 			}
 			cfg, err := loadConfig()
@@ -371,7 +398,10 @@ func watchConfig(globalTargets *targets, globalResolver Resolver, monitor *mon.M
 				log.Errorf("failed to reload config: %v", err)
 				continue
 			}
-		case err := <-watcher.Errors:
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return fmt.Errorf("config watcher error channel closed")
+			}
 			log.Errorf("watching file failed: %v", err)
 		}
 	}
@@ -387,13 +417,10 @@ func watchHTTPConfig(ctx context.Context, initial *config.Config, reload func(*c
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			cfg, err := loadConfigContext(ctx)
+			// A stale disk cache must not roll back an already running configuration.
+			cfg, err := loadConfigContext(ctx, false)
 			if err != nil {
 				log.Errorf("unable to load HTTP config: %v", err)
-				continue
-			}
-			if len(cfg.Targets) == 0 {
-				log.Error("ignoring HTTP config with no targets")
 				continue
 			}
 			if reflect.DeepEqual(current, cfg) {
@@ -418,13 +445,20 @@ func removedTargets(old []*target, new *targets) []*target {
 	return ret
 }
 
-func startDNSAutoRefresh(interval time.Duration, tar *targets, monitor *mon.Monitor, cfg *config.Config) {
+func startDNSAutoRefresh(ctx context.Context, interval time.Duration, tar *targets, monitor *mon.Monitor, cfg *config.Config) {
 	if interval <= 0 {
 		return
 	}
 
-	for range time.NewTicker(interval).C {
-		refreshDNS(tar, monitor, cfg)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			refreshDNS(tar, monitor, cfg)
+		}
 	}
 }
 
@@ -443,10 +477,13 @@ func refreshDNS(tar *targets, monitor *mon.Monitor, cfg *config.Config) {
 	}
 }
 
-func startServer(collector *pingCollector) {
+func startServer(ctx context.Context, collector prometheus.Collector) (result error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	var err error
 	log.Infof("Starting ping exporter (Version: %s)", version)
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if !hasValidToken(r, w) {
 			return
 		}
@@ -461,7 +498,7 @@ func startServer(collector *pingCollector) {
 	if len(*pushMetricsURLs) > 0 {
 		extraLabels, err := parsePushMetricsExtraLabels(*pushMetricsExtraLabels)
 		if err != nil {
-			log.Fatalf("invalid metrics push labels: %v", err)
+			return fmt.Errorf("invalid metrics push labels: %w", err)
 		}
 
 		pushWorkers := make([]*pushMetricsWorker, len(*pushMetricsURLs))
@@ -469,7 +506,7 @@ func startServer(collector *pingCollector) {
 			queueDir := filepath.Join(*pushMetricsQueueDir, strconv.Itoa(idx))
 			queue, err := openMetricsQueue(queueDir, *pushMetricsMaxDiskUsage, *pushMetricsMaxInmemory)
 			if err != nil {
-				log.Fatalf("could not open metrics queue for endpoint #%d: %v", idx+1, err)
+				return fmt.Errorf("could not open metrics queue for endpoint #%d: %w", idx+1, err)
 			}
 			pushWorkers[idx] = &pushMetricsWorker{
 				endpoint: url,
@@ -478,9 +515,14 @@ func startServer(collector *pingCollector) {
 			}
 		}
 
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		go runPushMetricsMulti(ctx, reg, pushWorkers, *pushMetricsInterval, *pushMetricsTimeout, extraLabels)
+		pushDone := make(chan error, 1)
+		go func() {
+			pushDone <- runPushMetricsMulti(ctx, reg, pushWorkers, *pushMetricsInterval, *pushMetricsTimeout, extraLabels)
+		}()
+		defer func() {
+			cancel()
+			result = errors.Join(result, <-pushDone)
+		}()
 		log.Infof("Metrics push enabled for %d endpoint(s) (interval %s, queue directory %s)",
 			len(*pushMetricsURLs), *pushMetricsInterval, *pushMetricsQueueDir)
 	}
@@ -492,7 +534,7 @@ func startServer(collector *pingCollector) {
 		ErrorLog:      l,
 		ErrorHandling: promhttp.ContinueOnError,
 	})
-	http.HandleFunc(*metricsPath, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(*metricsPath, func(w http.ResponseWriter, r *http.Request) {
 		if !hasValidToken(r, w) {
 			return
 		}
@@ -502,24 +544,45 @@ func startServer(collector *pingCollector) {
 
 	server := http.Server{
 		Addr:              *listenAddress,
+		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
 	if *serverUseTLS {
 		err = configureTLS(&server)
 		if err != nil {
-			log.Fatalf("could not configure TLS: %v", err)
+			return fmt.Errorf("could not configure TLS: %w", err)
 		}
+	}
+	serverDone := make(chan struct{})
+	shutdownDone := make(chan error, 1)
+	go func() {
+		select {
+		case <-ctx.Done():
+			shutdownCtx, stop := context.WithTimeout(context.Background(), 5*time.Second)
+			defer stop()
+			err := server.Shutdown(shutdownCtx)
+			if err != nil {
+				err = errors.Join(err, server.Close())
+			}
+			shutdownDone <- err
+		case <-serverDone:
+			shutdownDone <- nil
+		}
+	}()
+
+	if *serverUseTLS {
 		log.Infof("Listening for %s on %s (HTTPS)", *metricsPath, *listenAddress)
 		err = server.ListenAndServeTLS("", "")
 	} else {
 		log.Infof("Listening for %s on %s (HTTP)", *metricsPath, *listenAddress)
 		err = server.ListenAndServe()
 	}
-
-	if err != nil && err != http.ErrServerClosed {
-		log.Fatal(err)
+	close(serverDone)
+	if errors.Is(err, http.ErrServerClosed) {
+		err = nil
 	}
+	return errors.Join(err, <-shutdownDone)
 }
 
 func hasValidToken(r *http.Request, w http.ResponseWriter) bool {
@@ -589,7 +652,7 @@ func initMutualAuth(server *http.Server) error {
 }
 
 func loadConfig() (*config.Config, error) {
-	return loadConfigContext(context.Background())
+	return loadConfigContext(context.Background(), true)
 }
 
 func isHTTPConfig(path string) bool {
@@ -597,7 +660,7 @@ func isHTTPConfig(path string) bool {
 	return strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://")
 }
 
-func loadConfigContext(ctx context.Context) (*config.Config, error) {
+func loadConfigContext(ctx context.Context, allowCached bool) (*config.Config, error) {
 	if *configFile == "" {
 		cfg := config.Config{}
 		addFlagToConfig(&cfg)
@@ -608,21 +671,7 @@ func loadConfigContext(ctx context.Context) (*config.Config, error) {
 	var f io.ReadCloser
 	var err error
 	if isHTTPConfig(*configFile) {
-		req, requestErr := http.NewRequestWithContext(ctx, http.MethodGet, *configFile, nil)
-		if requestErr != nil {
-			return nil, fmt.Errorf("cannot create config request: %w", requestErr)
-		}
-		resp, requestErr := configHTTPClient.Do(req)
-		if requestErr != nil {
-			return nil, fmt.Errorf("cannot fetch config: %w", requestErr)
-		}
-		f = resp.Body
-		if resp.StatusCode != http.StatusOK {
-			if err := f.Close(); err != nil {
-				log.Errorf("failed to close config response: %v", err)
-			}
-			return nil, fmt.Errorf("cannot fetch config: HTTP %s", resp.Status)
-		}
+		f, err = fetchConfigWithCache(ctx, *configFile, getConfigCachePath(*configFile), allowCached)
 	} else {
 		f, err = os.Open(*configFile)
 	}
@@ -664,7 +713,7 @@ func setupGlobalResolver(cfg *config.Config) Resolver {
 // addFlagToConfig updates cfg with command line flag values, unless the
 // config has non-zero values.
 func addFlagToConfig(cfg *config.Config) {
-	if len(cfg.Targets) == 0 {
+	if cfg.Targets == nil && len(*targetFlag) > 0 {
 		cfg.Targets = make([]config.TargetConfig, len(*targetFlag))
 		for i, t := range *targetFlag {
 			cfg.Targets[i] = config.TargetConfig{

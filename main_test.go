@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -19,6 +21,7 @@ import (
 
 	"github.com/alecthomas/kingpin/v2"
 	"github.com/czerwonk/ping_exporter/config"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 func TestEnvironmentFlagProcess(t *testing.T) {
@@ -154,11 +157,13 @@ func TestEnvironmentFlags(t *testing.T) {
 
 func preserveConfigFlags(t *testing.T) {
 	t.Helper()
-	path, refresh, client, targets := *configFile, *configRefresh, configHTTPClient, *targetFlag
+	path, refresh, client, targets, baseDir := *configFile, *configRefresh, configHTTPClient, *targetFlag, *pushMetricsBaseDir
 	t.Cleanup(func() {
 		*configFile, *configRefresh, configHTTPClient, *targetFlag = path, refresh, client, targets
+		*pushMetricsBaseDir = baseDir
 	})
 	*targetFlag = nil
+	*pushMetricsBaseDir = t.TempDir()
 }
 
 func TestLoadConfigSources(t *testing.T) {
@@ -217,7 +222,9 @@ func TestLoadConfigSources(t *testing.T) {
 			t.Fatalf("unexpected flag targets: %#v", cfg.Targets)
 		}
 		// With no configuration source there is nothing to watch.
-		watchConfig(nil, nil, nil, nil, cfg)
+		if err := watchConfig(context.Background(), nil, nil, nil, nil, cfg); err != nil {
+			t.Fatal(err)
+		}
 	})
 }
 
@@ -263,7 +270,7 @@ func TestLoadHTTPConfigErrors(t *testing.T) {
 	t.Run("cancelled", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		if _, err := loadConfigContext(ctx); err == nil {
+		if _, err := loadConfigContext(ctx, true); err == nil {
 			t.Fatal("expected request cancellation")
 		}
 	})
@@ -358,8 +365,71 @@ func TestExplicitEmptyTargets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	addFlagToConfig(cfg)
 	if cfg.Targets == nil || len(cfg.Targets) != 0 {
 		t.Fatalf("explicit empty targets replaced by CLI targets: %#v", cfg.Targets)
+	}
+}
+
+func TestStartServerWaitsForPersistence(t *testing.T) {
+	urls, dir, capacity := *pushMetricsURLs, *pushMetricsQueueDir, *pushMetricsMaxInmemory
+	interval, timeout, maxBytes := *pushMetricsInterval, *pushMetricsTimeout, *pushMetricsMaxDiskUsage
+	address, tlsEnabled, path := *listenAddress, *serverUseTLS, *metricsPath
+	t.Cleanup(func() {
+		*pushMetricsURLs, *pushMetricsQueueDir, *pushMetricsMaxInmemory = urls, dir, capacity
+		*pushMetricsInterval, *pushMetricsTimeout, *pushMetricsMaxDiskUsage = interval, timeout, maxBytes
+		*listenAddress, *serverUseTLS, *metricsPath = address, tlsEnabled, path
+	})
+	*pushMetricsQueueDir = t.TempDir()
+	*pushMetricsMaxInmemory, *pushMetricsMaxDiskUsage = 100, 1<<20
+	*pushMetricsInterval, *pushMetricsTimeout = time.Hour, time.Hour
+	*listenAddress, *serverUseTLS, *metricsPath = "127.0.0.1:0", false, "/metrics"
+	started := make(chan struct{}, 1)
+	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Read the upload before blocking so cancellation reaches the server.
+		_, _ = io.Copy(io.Discard, r.Body)
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		<-r.Context().Done()
+	}))
+	defer remote.Close()
+	*pushMetricsURLs = []string{remote.URL}
+	collector := prometheus.NewGauge(prometheus.GaugeOpts{Name: "shutdown_test", Help: "Test metric"})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- startServer(ctx, collector) }()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not start pushing")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not shut down")
+	}
+	queue, err := openMetricsQueue(filepath.Join(*pushMetricsQueueDir, "0"), 1<<20, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertMetricsQueueState(t, queue, 0, 1)
+
+	// Listener failures must return normally so persistence defers can run.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	*listenAddress = listener.Addr().String()
+	if err := startServer(context.Background(), collector); err == nil {
+		t.Fatal("expected listener error")
 	}
 }

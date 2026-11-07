@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/czerwonk/ping_exporter/config"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -46,9 +48,28 @@ func saveConfigCache(cachePath string, content []byte) error {
 		return fmt.Errorf("failed to create cache directory %s: %w", cacheDir, err)
 	}
 
-	// Write cache file with restricted permissions
-	if err := os.WriteFile(cachePath, content, 0644); err != nil {
-		return fmt.Errorf("failed to write config cache: %w", err)
+	file, err := os.CreateTemp(cacheDir, ".config-*")
+	if err != nil {
+		return fmt.Errorf("failed to create config cache: %w", err)
+	}
+	defer func() {
+		if err := os.Remove(file.Name()); err != nil && !os.IsNotExist(err) {
+			log.WithError(err).Warn("failed to remove temporary config cache")
+		}
+	}()
+	_, writeErr := file.Write(content)
+	if writeErr == nil {
+		writeErr = file.Sync()
+	}
+	closeErr := file.Close()
+	if writeErr != nil {
+		return fmt.Errorf("failed to write config cache: %w", writeErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("failed to close config cache: %w", closeErr)
+	}
+	if err := os.Rename(file.Name(), cachePath); err != nil {
+		return fmt.Errorf("failed to replace config cache: %w", err)
 	}
 
 	log.Debugf("config cache saved to %s", cachePath)
@@ -61,91 +82,76 @@ func loadConfigCache(cachePath string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to read config cache: %w", err)
 	}
-	log.Warnf("config cache loaded from %s (using fallback due to remote unavailable)", cachePath)
 	return content, nil
 }
 
 // fetchConfigWithCache fetches the config from a URL with fallback to local cache.
 // If the URL is not available and a cache exists, it uses the cached version.
 // The successful fetch result is saved to cache for future use.
-func fetchConfigWithCache(ctx context.Context, configURL string, cachePath string) (io.ReadCloser, error) {
-	// Try to fetch from URL first
+func fetchConfigWithCache(ctx context.Context, configURL string, cachePath string, allowCached bool) (io.ReadCloser, error) {
+	content, err := fetchConfigContent(ctx, configURL)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if !allowCached {
+			return nil, err
+		}
+		log.WithError(err).Warn("failed to fetch valid HTTP config; trying local cache")
+		cached, cacheErr := loadConfigCache(cachePath)
+		if cacheErr == nil {
+			cacheErr = validateConfigContent(cached)
+		}
+		if cacheErr != nil {
+			return nil, fmt.Errorf("%w; cached config unavailable: %w", err, cacheErr)
+		}
+		log.Warnf("using cached config from %s", cachePath)
+		return io.NopCloser(bytes.NewReader(cached)), nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := saveConfigCache(cachePath, content); err != nil {
+		log.WithError(err).Warn("HTTP config loaded but could not be cached")
+	}
+	return io.NopCloser(bytes.NewReader(content)), nil
+}
+
+func fetchConfigContent(ctx context.Context, configURL string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, configURL, nil)
 	if err != nil {
-		// URL parsing failed, try cache
-		log.Warnf("failed to create config request: %v", err)
-		content, cacheErr := loadConfigCache(cachePath)
-		if cacheErr == nil {
-			return io.NopCloser(newBytesReader(content)), nil
-		}
-		// Return original error if cache also failed
-		return nil, fmt.Errorf("cannot create config request: %w (and no cache available)", err)
+		return nil, fmt.Errorf("cannot create config request: %w", err)
 	}
 
 	resp, err := configHTTPClient.Do(req)
 	if err != nil {
-		// Network error, try cache
-		log.Warnf("failed to fetch config from %s: %v, trying cache...", configURL, err)
-		content, cacheErr := loadConfigCache(cachePath)
-		if cacheErr == nil {
-			return io.NopCloser(newBytesReader(content)), nil
-		}
-		// Return original error if cache also failed
-		return nil, fmt.Errorf("cannot fetch config: %w (and no cache available)", err)
+		return nil, fmt.Errorf("cannot fetch config: %w", err)
 	}
-
-	// Check HTTP status
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.WithError(err).Warn("failed to close config response")
+		}
+	}()
 	if resp.StatusCode != http.StatusOK {
-		_ = resp.Body.Close()
-		// HTTP error, try cache
-		log.Warnf("config fetch returned HTTP %s, trying cache...", resp.Status)
-		content, cacheErr := loadConfigCache(cachePath)
-		if cacheErr == nil {
-			return io.NopCloser(newBytesReader(content)), nil
-		}
-		// Return original error if cache also failed
-		return nil, fmt.Errorf("cannot fetch config: HTTP %s (and no cache available)", resp.Status)
+		return nil, fmt.Errorf("cannot fetch config: HTTP %s", resp.Status)
 	}
-
-	// Successfully fetched, read and cache the content
 	content, err := io.ReadAll(resp.Body)
-	resp.Body.Close()
-
 	if err != nil {
-		log.Warnf("failed to read config response body: %v", err)
-		// Try cache as fallback
-		cacheContent, cacheErr := loadConfigCache(cachePath)
-		if cacheErr == nil {
-			return io.NopCloser(newBytesReader(cacheContent)), nil
-		}
 		return nil, fmt.Errorf("failed to read config response: %w", err)
 	}
-
-	// Save to cache for future use
-	if err := saveConfigCache(cachePath, content); err != nil {
-		log.Warnf("failed to save config cache: %v", err)
-		// Continue anyway, cache saving is not critical
+	if err := validateConfigContent(content); err != nil {
+		return nil, err
 	}
-
-	log.Debugf("config successfully fetched from %s and cached", configURL)
-	return io.NopCloser(newBytesReader(content)), nil
+	return content, nil
 }
 
-// bytesReader implements io.Reader for byte slices.
-type bytesReader struct {
-	data []byte
-	pos  int
-}
-
-func newBytesReader(data []byte) *bytesReader {
-	return &bytesReader{data: data, pos: 0}
-}
-
-func (br *bytesReader) Read(p []byte) (int, error) {
-	if br.pos >= len(br.data) {
-		return 0, io.EOF
+func validateConfigContent(content []byte) error {
+	cfg, err := config.FromYAML(bytes.NewReader(content))
+	if err != nil {
+		return err
 	}
-	n := copy(p, br.data[br.pos:])
-	br.pos += n
-	return n, nil
+	if cfg.Targets == nil {
+		return fmt.Errorf("HTTP config must contain a targets field")
+	}
+	return nil
 }

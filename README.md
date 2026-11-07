@@ -86,10 +86,19 @@ Remote configurations are fetched at startup and polled every minute by default.
 Use `--config.refresh` to set a positive polling interval. Each HTTP request has
 a 10-second timeout, and HTTPS uses the system's trusted certificates. The server
 must return HTTP 200 with the same YAML format as a local configuration file.
-Unchanged configurations are not reapplied. Failed requests, invalid YAML, or
-configurations without a targets field are logged and leave the current targets in place;
-polling continues so later updates can recover. An initial fetch failure prevents
-startup. An explicit `targets: []` is accepted at startup and on reload, and stops
+Valid downloads are atomically cached under
+`<pushmetrics.base-dir>/config-cache/config_<URL hash>.cache`, even when pushing
+metrics is disabled. `PING_PUSHMETRICS_BASE_DIR` controls the same base directory
+(default `/var/lib/ping_exporter`). Invalid YAML or a missing `targets` field
+never replaces a valid cache. Cache write errors are logged without discarding a
+valid download.
+
+Unchanged configurations are not reapplied. Failed polling requests and invalid
+configurations are logged and leave the current targets in place; polling
+continues so later updates can recover. At startup, an unavailable or invalid
+remote configuration falls back to the validated cache for that URL. Startup
+fails if neither source is usable. An explicit `targets: []` is accepted at
+startup and on reload, and stops
 all target monitoring while keeping `ping_up` available. An empty target list is
 not replaced by positional command-line targets. As with local files, ping and
 DNS options require a restart; labels do not.
@@ -224,9 +233,17 @@ limit counts batches, not bytes; actual memory use depends on snapshot sizes.
 Network failures and non-2xx responses retain the batch for retry. One sender
 replays oldest batches first, independently of periodic collection, and removes
 a batch only after a successful response. Restarting with the same directory
-recovers disk batches, but unsent batches still in memory are lost when the
-process exits. Set `--pushmetrics.max-inmemory-requests=0` to retain the original
-write-before-send behavior when restart durability is required for every batch.
+recovers disk batches. On SIGINT/SIGTERM (including `systemctl stop`/`restart`) or
+Windows service stop, the exporter stops collection, cancels and waits for
+in-flight pushes, and writes every remaining in-memory batch to disk before
+exiting. Each endpoint queue is saved independently, preserving FIFO order.
+Disk limits still apply: write/limit failures are reported and make shutdown
+fail rather than silently claiming that all data was saved.
+
+SIGKILL, a crash, power loss, or a supervisor forcibly killing the process before
+shutdown completes cannot run this cleanup. Set
+`--pushmetrics.max-inmemory-requests=0` to write each batch before sending when
+memory loss on abrupt termination is unacceptable.
 HTTPS uses the system trust store; HTTP redirects are not followed.
 
 Use a persistent volume in containers and a separate queue directory for each
