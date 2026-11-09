@@ -183,6 +183,36 @@ backs up existing files, and writes:
 - `/etc/systemd/system/ping_exporter.service` (mode `0644`, runs as root for ICMP).
 - `/etc/default/ping_exporter` (mode `0600`, systemd environment-file syntax).
 
+Leave the service instance name empty to use these original paths. To install
+multiple instances, enter a name such as `cn` or `us` and run the installer once
+per instance. Instance names may contain ASCII letters, digits, underscores,
+dots and hyphens, must start with a letter, digit or underscore, and are limited
+to 233 characters.
+
+For instance `cn`, the installer writes:
+
+- `/etc/systemd/system/ping_exporter@.service`, a shared template.
+- `/etc/default/ping_exporter-cn`, the instance's environment file (mode `0600`).
+
+The template uses `EnvironmentFile=/etc/default/ping_exporter-%i`; systemd
+substitutes the instance name for `%i`. Only `ping_exporter@cn.service` is
+enabled/restarted when requested. Its default data directory is
+`/var/lib/ping_exporter/instances/cn`. Assign different listening addresses/ports
+and independent data directories to instances; never share push queues.
+All instances share the template and executable path. Reinstalling backs up and
+updates the shared template, affecting other instances on their next start or
+restart, but does not overwrite their environment files or restart them.
+The original non-instance service can coexist with template instances.
+
+For example:
+
+```console
+$ sudoedit /etc/default/ping_exporter-cn
+$ sudo systemctl restart ping_exporter@cn.service
+$ sudo systemctl status ping_exporter@cn.service --no-pager
+$ sudo journalctl -u ping_exporter@cn.service -n 50
+```
+
 No configuration is written before confirmation. You choose whether to enable
 and start/restart the service; declining leaves an existing service running with
 its previous configuration until restarted. Existing environment files are
